@@ -11,8 +11,8 @@ android {
         applicationId = "com.neotv.app"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
     }
 
     buildFeatures {
@@ -42,7 +42,10 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Moteur vidéo ultra-fluide Media3 ExoPlayer (HLS / IPTV)
+    // Moteur d'images ultra-rapide pour Logos TV & Affiches Films/Séries
+    implementation("io.coil-kt:coil-compose:2.6.0")
+
+    // Moteur vidéo ultra-fluide Media3 ExoPlayer (HLS / TS / MP4 / MKV)
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
