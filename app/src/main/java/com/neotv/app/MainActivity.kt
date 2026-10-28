@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
+import android.view.LayoutInflater
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -73,6 +74,7 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -93,7 +95,7 @@ class MainActivity : ComponentActivity() {
                     primary = Color(0xFF8B5CF6)
                 )
             ) {
-                NeoTvV5App()
+                NeoTvApp()
             }
         }
     }
@@ -190,7 +192,8 @@ fun openTrailerYoutube(context: Context, title: String, youtubeCode: String) {
         clean.startsWith("http") -> clean
         clean.isNotBlank() && clean != "null" -> "https://www.youtube.com/watch?v=$clean"
         else -> {
-            val query = URLEncoder.encode("$title bande annonce VF trailer", "UTF-8")
+            val cleanTitle = title.replace(Regex("""^\|[A-Za-z0-9 -]+\|\s*"""), "").trim()
+            val query = URLEncoder.encode("$cleanTitle bande annonce VF", "UTF-8")
             "https://www.youtube.com/results?search_query=$query"
         }
     }
@@ -203,7 +206,7 @@ fun openTrailerYoutube(context: Context, title: String, youtubeCode: String) {
 }
 
 @Composable
-fun NeoTvV5App() {
+fun NeoTvApp() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -281,7 +284,7 @@ fun NeoTvV5App() {
     fun loadEpgForChannel(streamId: String) {
         if (serverUrl.isBlank() || epgCache.containsKey(streamId)) return
         scope.launch {
-            val progs = fetchChannelEpgList(serverUrl, username, password, streamId, limit = 25)
+            val progs = fetchChannelEpgList(serverUrl, username, password, streamId)
             if (progs.isNotEmpty()) {
                 epgCache = epgCache + (streamId to progs)
             }
@@ -294,20 +297,20 @@ fun NeoTvV5App() {
         errorMsg = null
         scope.launch {
             try {
-                statusText = "Vérification de l'abonnement Xtream..."
+                statusText = "Vérification de l'abonnement..."
                 accountInfo = fetchAccountInfo(serverUrl, username, password)
 
-                statusText = "Synchronisation Direct TV & Grille EPG..."
+                statusText = "Synchronisation TV en direct & Guide TV..."
                 val liveRes = fetchXtreamLive(context, serverUrl, username, password, forceRefresh)
                 liveCategories = liveRes.first
                 liveChannels = liveRes.second
 
-                statusText = "Synchronisation Catalogue Films..."
+                statusText = "Synchronisation Films..."
                 val vodRes = fetchXtreamVod(context, serverUrl, username, password, forceRefresh)
                 vodCategories = vodRes.first
                 vodMovies = vodRes.second
 
-                statusText = "Synchronisation Catalogue Séries..."
+                statusText = "Synchronisation Séries..."
                 val serRes = fetchXtreamSeries(context, serverUrl, username, password, forceRefresh)
                 seriesCategories = serRes.first
                 seriesList = serRes.second
@@ -338,7 +341,7 @@ fun NeoTvV5App() {
                 username = username,
                 password = password,
                 liveChannelList = if (currentMedia.type == "LIVE") {
-                    liveChannels.filter { selectedCatId == "ALL" || it.categoryId == selectedCatId }
+                    liveChannels.filter { selectedCatId == "ALL" || selectedCatId == "FAV" || it.categoryId == selectedCatId }
                 } else emptyList(),
                 onSwitchChannel = { nextChannel ->
                     loadEpgForChannel(nextChannel.id)
@@ -365,7 +368,7 @@ fun NeoTvV5App() {
         selectedMovieForDetails != null -> {
             val movie = selectedMovieForDetails!!
             val savedPos = prefs.getLong("pos_${movie.id}", 0L)
-            NetflixStyleMovieDetailScreen(
+            MovieDetailScreen(
                 movie = movie,
                 details = movieDetails,
                 isLoading = isMovieDetailsLoading,
@@ -391,11 +394,10 @@ fun NeoTvV5App() {
         }
         selectedSeries != null -> {
             val serie = selectedSeries!!
-            NetflixStyleSeriesDetailScreen(
+            SeriesDetailScreen(
                 series = serie,
                 episodes = seriesEpisodes,
                 plot = seriesPlot,
-                trailerCode = seriesTrailer.ifBlank { serie.trailerId },
                 isLoading = isSeriesLoading,
                 onBack = { selectedSeries = null },
                 onWatchTrailer = {
@@ -451,7 +453,7 @@ fun NeoTvV5App() {
                 watchHistoryIds.mapNotNull { allMedia[it] }
             }
 
-            MainNeoProScreen(
+            MainScreen(
                 selectedTab = selectedTab,
                 onChangeTab = { newTab ->
                     if (newTab != selectedTab) {
@@ -464,7 +466,6 @@ fun NeoTvV5App() {
                 onChangeCategory = { selectedCatId = it },
                 searchQuery = searchQuery,
                 onChangeSearch = { searchQuery = it },
-                liveListState = liveListState,
                 gridState = gridState,
                 accountInfo = accountInfo,
                 liveChannels = liveChannels,
@@ -526,14 +527,13 @@ fun NeoTvV5App() {
 }
 
 @Composable
-fun MainNeoProScreen(
+fun MainScreen(
     selectedTab: Int,
     onChangeTab: (Int) -> Unit,
     selectedCatId: String,
     onChangeCategory: (String) -> Unit,
     searchQuery: String,
     onChangeSearch: (String) -> Unit,
-    liveListState: LazyListState,
     gridState: LazyGridState,
     accountInfo: AccountInfo,
     liveChannels: List<MediaEntry>,
@@ -556,7 +556,8 @@ fun MainNeoProScreen(
     onPlayReplayFromGrid: (MediaEntry, EpgProgram) -> Unit,
     onSelectMedia: (MediaEntry) -> Unit
 ) {
-    val tabs = listOf("Accueil", "Guide TV (TiviMate)", "Films", "Séries", "Favoris")
+    // VRAIS NOMS SOBRES ET OFFICIELS (Sans aucune marque externe)
+    val tabs = listOf("Accueil", "TV en direct", "Films", "Séries", "Favoris")
 
     val currentCategories = when (selectedTab) {
         1 -> liveCategories
@@ -594,7 +595,7 @@ fun MainNeoProScreen(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("NEO", color = Color(0xFF38BDF8), fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
-                Text(" TV 5.0", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Light)
+                Text(" TV", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Light)
             }
 
             LazyRow(
@@ -607,13 +608,13 @@ fun MainNeoProScreen(
                         modifier = Modifier
                             .tvFocusableClick(CircleShape, onClick = { onChangeTab(index) })
                             .background(if (isSelected) Color(0xFF8B5CF6) else Color(0xFF151A24))
-                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                            .padding(horizontal = 16.dp, vertical = 7.dp)
                     ) {
                         Text(
                             text = tab,
                             color = if (isSelected) Color.White else Color(0xFF94A3B8),
                             fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                            fontSize = 12.sp
+                            fontSize = 13.sp
                         )
                     }
                 }
@@ -636,7 +637,7 @@ fun MainNeoProScreen(
                         .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = if (liveChannels.isEmpty()) "IPTV" else "Exp: ${accountInfo.expDateFormatted}",
+                        text = if (liveChannels.isEmpty()) "Paramètres" else "Exp: ${accountInfo.expDateFormatted}",
                         color = Color.White,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
@@ -662,7 +663,6 @@ fun MainNeoProScreen(
             Text(it, color = Color(0xFFEF4444), fontSize = 12.sp)
         }
 
-        // Si on n'est pas sur la grille TiviMate (qui a sa propre colonne de catégories à gauche), on affiche la barre de recherche et de catégories
         if (selectedTab != 1) {
             OutlinedTextField(
                 value = searchQuery,
@@ -700,43 +700,31 @@ fun MainNeoProScreen(
 
         when (selectedTab) {
             0 -> {
-                HomeProDashboard(
+                HomeDashboard(
                     liveChannels = liveChannels.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     vodMovies = vodMovies.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     seriesList = seriesList.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     resumeItems = resumeItems,
                     prefs = prefs,
-                    epgNowCache = epgCache,
+                    epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
                     onSelectMedia = onSelectMedia,
                     onSelectTab = onChangeTab
                 )
             }
             1 -> {
-                // LA VRAIE GRILLE TV MULTI-HEURES FAÇON TIVIMATE (COMME SUR VOTRE PHOTO !)
-                TiviMateStyleGuideScreen(
+                TvGuideScreen(
                     categories = liveCategories,
                     selectedCatId = selectedCatId,
                     onSelectCategory = onChangeCategory,
                     channels = currentList,
-                    favorites = favorites,
                     epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
-                    onToggleFav = onToggleFav,
                     onPlayChannelFullscreen = onSelectMedia,
                     onPlayReplayProgram = onPlayReplayFromGrid
                 )
             }
-            2, 3 -> {
-                PosterGrid(
-                    gridState = gridState,
-                    items = currentList,
-                    favorites = favorites,
-                    onToggleFav = onToggleFav,
-                    onPlayMedia = onSelectMedia
-                )
-            }
-            4 -> {
+            2, 3, 4 -> {
                 PosterGrid(
                     gridState = gridState,
                     items = currentList,
@@ -750,19 +738,17 @@ fun MainNeoProScreen(
 }
 
 // =========================================================================
-// 1. LA VRAIE GRILLE TV FAÇON TIVIMATE (AVEC MINI-LECTEUR + TIMELINE HORIZONTALE)
+// 1. GUIDE TV HORIZONTAL PARFAITEMENT CALIBRÉ SUR L'HEURE ACTUELLE
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun TiviMateStyleGuideScreen(
+fun TvGuideScreen(
     categories: List<CategoryItem>,
     selectedCatId: String,
     onSelectCategory: (String) -> Unit,
     channels: List<MediaEntry>,
-    favorites: Set<String>,
     epgCache: Map<String, List<EpgProgram>>,
     onRequestEpg: (String) -> Unit,
-    onToggleFav: (String) -> Unit,
     onPlayChannelFullscreen: (MediaEntry) -> Unit,
     onPlayReplayProgram: (MediaEntry, EpgProgram) -> Unit
 ) {
@@ -770,7 +756,6 @@ fun TiviMateStyleGuideScreen(
     var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
-    // Mini-lecteur ExoPlayer pour l'aperçu vidéo en haut à gauche (comme sur TiviMate)
     val miniPlayer = remember {
         ExoPlayer.Builder(context).build().apply {
             volume = 1f
@@ -791,12 +776,18 @@ fun TiviMateStyleGuideScreen(
     }
 
     val nowSec = System.currentTimeMillis() / 1000L
-    // Début de la grille calé sur la demi-heure précédente (ex: 21:00 ou 21:30)
-    val baseTimelineSec = remember { (nowSec / 1800L) * 1800L - 1800L }
-    val timeSlots = remember(baseTimelineSec) {
+    // Point de départ de la grille : pile sur la demi-heure en cours (ex: 22:30)
+    val timelineStartSec = remember { (nowSec / 1800L) * 1800L }
+    val timelineEndSec = remember { timelineStartSec + 6 * 3600L } // 6 heures de visibilité
+
+    // Échelle exacte : 1 minute = 4.dp -> 30 minutes = 120.dp exactement !
+    val dpPerMinute = 4f
+    val slotWidthDp = (30 * dpPerMinute).dp // 120.dp par tranche de 30 min
+
+    val timeSlots = remember(timelineStartSec) {
         val sdf = SimpleDateFormat("HH:mm", Locale.FRANCE)
-        (0..8).map { idx ->
-            val slotSec = baseTimelineSec + idx * 1800L
+        (0..11).map { idx ->
+            val slotSec = timelineStartSec + idx * 1800L
             sdf.format(Date(slotSec * 1000L))
         }
     }
@@ -807,7 +798,7 @@ fun TiviMateStyleGuideScreen(
     val horizontalScrollState = rememberScrollState()
 
     Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
-        // COLONNE GAUCHE : CATÉGORIES (Favoris, Toutes les chaînes, FRANCE HD, CINEMA HD...)
+        // COLONNE GAUCHE : CATÉGORIES
         LazyColumn(
             modifier = Modifier
                 .width(165.dp)
@@ -817,31 +808,30 @@ fun TiviMateStyleGuideScreen(
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             item {
-                TiviCategoryRow("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV") }
+                CategoryRowItem("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV") }
             }
             item {
-                TiviCategoryRow("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL") }
+                CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL") }
             }
             items(categories) { cat ->
-                TiviCategoryRow(cat.name, selectedCatId == cat.id) { onSelectCategory(cat.id) }
+                CategoryRowItem(cat.name, selectedCatId == cat.id) { onSelectCategory(cat.id) }
             }
         }
 
         Spacer(modifier = Modifier.width(8.dp))
 
-        // PARTIE DROITE : HAUT (MINI-LECTEUR + DESCRIPTION PROGRAMME) & BAS (GRILLE HORIZONTALE)
+        // PARTIE DROITE : APERÇU EN HAUT + GRILLE ALIGNÉE EN BAS
         Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-            // HAUT : APERÇU VIDÉO EN DIRECT + DÉTAILS DU PROGRAMME SÉLECTIONNÉ (Exactement comme la photo TiviMate)
+            // HAUT : MINI-LECTEUR VIDÉO + DESCRIPTION DU PROGRAMME EN COURS
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(135.dp)
+                    .height(132.dp)
                     .background(Color(0xFF111622))
                     .clip(RoundedCornerShape(10.dp))
                     .padding(8.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp)
             ) {
-                // Mini-écran TV cliquable (1 clic sur la miniature = passage en plein écran)
                 Box(
                     modifier = Modifier
                         .width(210.dp)
@@ -853,27 +843,20 @@ fun TiviMateStyleGuideScreen(
                 ) {
                     AndroidView(
                         factory = { ctx ->
-                            PlayerView(ctx).apply {
+                            (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                                 player = miniPlayer
-                                useController = false
                                 resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             }
                         },
                         modifier = Modifier.fillMaxSize()
                     )
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomStart)
-                            .background(Color(0xAA000000))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text("Cliquer = Plein Écran", color = Color.White, fontSize = 9.sp)
-                    }
                 }
 
-                // Détails du programme (Titre, Horaire, Barre de progression, Synopsis)
+                // Trouve automatiquement l'émission en cours à l'heure actuelle
+                val currentChannelProgs = previewChannel?.let { epgCache[it.id] } ?: emptyList()
                 val activeProg = highlightedProgram
-                    ?: previewChannel?.let { epgCache[it.id]?.firstOrNull() }
+                    ?: currentChannelProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
+                    ?: currentChannelProgs.firstOrNull()
 
                 Column(
                     modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -889,20 +872,30 @@ fun TiviMateStyleGuideScreen(
                     )
 
                     if (activeProg != null) {
+                        val totalDuration = (activeProg.stopTimestamp - activeProg.startTimestamp).coerceAtLeast(1L)
+                        val elapsed = (nowSec - activeProg.startTimestamp).coerceIn(0L, totalDuration)
+                        val progFraction = elapsed.toFloat() / totalDuration.toFloat()
                         val remainMin = ((activeProg.stopTimestamp - nowSec) / 60L).coerceAtLeast(0L)
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
                                 text = "${activeProg.startFormatted} – ${activeProg.stopFormatted}",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
+                            LinearProgressIndicator(
+                                progress = progFraction,
+                                modifier = Modifier.width(70.dp).height(4.dp).clip(CircleShape),
+                                color = Color(0xFF38BDF8),
+                                trackColor = Color(0xFF334155)
+                            )
                             if (remainMin in 1..300) {
-                                Text("• reste ${remainMin} min", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                                Text("${remainMin} min", color = Color(0xFF94A3B8), fontSize = 12.sp)
                             }
                         }
                         Text(
-                            text = activeProg.description.ifBlank { "Chaîne : ${previewChannel?.title ?: ""} • Appuyez sur OK pour regarder en plein écran." },
+                            text = activeProg.description.ifBlank { "En direct sur ${previewChannel?.title ?: ""}" },
                             color = Color(0xFFCBD5E1),
                             fontSize = 12.sp,
                             maxLines = 3,
@@ -910,15 +903,15 @@ fun TiviMateStyleGuideScreen(
                         )
                     } else {
                         Text(
-                            text = "Catégorie : ${previewChannel?.categoryName ?: ""}",
+                            text = previewChannel?.categoryName ?: "",
                             color = Color(0xFF38BDF8),
                             fontSize = 12.sp
                         )
                         Text(
-                            text = "Appuyez une fois sur une chaîne pour la prévisualiser dans le mini-lecteur, ou recliquez dessus pour l'ouvrir en plein écran.",
+                            text = "Cliquez une deuxième fois sur la chaîne ou sur l'aperçu vidéo pour passer en plein écran.",
                             color = Color(0xFF94A3B8),
                             fontSize = 12.sp,
-                            maxLines = 3
+                            maxLines = 2
                         )
                     }
                 }
@@ -926,7 +919,7 @@ fun TiviMateStyleGuideScreen(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // EN-TÊTE DE LA LIGNE DU TEMPS (Date à gauche + 21:00 | 21:30 | 22:00 | 22:30 | 23:00...)
+            // BARRE DES HORAIRES ALIGNÉE AU PIXEL PRÈS (120.dp par tranche de 30 min)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -944,21 +937,25 @@ fun TiviMateStyleGuideScreen(
 
                 Row(modifier = Modifier.horizontalScroll(horizontalScrollState)) {
                     timeSlots.forEach { slotLabel ->
-                        Box(modifier = Modifier.width(160.dp)) {
+                        Box(modifier = Modifier.width(slotWidthDp)) {
                             Text(slotLabel, color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
             }
 
-            // LIGNES DES CHAÎNES + CASES HORIZONTALES DES PROGRAMMES EPG
+            // LIGNES DES CHAÎNES + PROGRAMMES ALIGNÉS SUR LA GRILLE HORAIRE
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
                 itemsIndexed(channels, key = { _, ch -> ch.id }) { index, ch ->
                     LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
-                    val progs = epgCache[ch.id] ?: emptyList()
+                    val allProgs = epgCache[ch.id] ?: emptyList()
+                    // On ne garde que les émissions qui ne sont pas encore terminées au début de la grille !
+                    val visibleProgs = remember(allProgs, timelineStartSec) {
+                        allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
+                    }
                     val isPlayingInMini = previewChannel?.id == ch.id
 
                     Row(
@@ -968,24 +965,24 @@ fun TiviMateStyleGuideScreen(
                             .background(if (isPlayingInMini) Color(0xFF1E293B) else Color(0xFF111622)),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // CASE CHAÎNE À GAUCHE (Numéro + Logo + Nom + Icône Replay)
+                        // COLONNE NOM & LOGO DE LA CHAÎNE
                         Row(
                             modifier = Modifier
-                                .width(210.dp)
+                                .width(218.dp)
                                 .fillMaxHeight()
                                 .tvFocusableClick(
                                     RoundedCornerShape(6.dp),
                                     defaultBorderWidth = 0.dp,
                                     onFocused = {
                                         previewChannel = ch
-                                        highlightedProgram = progs.firstOrNull()
+                                        highlightedProgram = visibleProgs.firstOrNull()
                                     },
                                     onClick = {
                                         if (previewChannel?.id == ch.id) {
                                             onPlayChannelFullscreen(ch)
                                         } else {
                                             previewChannel = ch
-                                            highlightedProgram = progs.firstOrNull()
+                                            highlightedProgram = visibleProgs.firstOrNull()
                                         }
                                     }
                                 )
@@ -1003,7 +1000,7 @@ fun TiviMateStyleGuideScreen(
                                 model = ch.logoUrl,
                                 contentDescription = ch.title,
                                 modifier = Modifier
-                                    .size(32.dp)
+                                    .size(30.dp)
                                     .clip(RoundedCornerShape(4.dp))
                                     .background(Color.Black),
                                 contentScale = ContentScale.Fit
@@ -1028,22 +1025,22 @@ fun TiviMateStyleGuideScreen(
                             }
                         }
 
-                        // CASES HORIZONTALES DES PROGRAMMES SUR PLUSIEURS HEURES
+                        // CASES HORIZONTALES DES PROGRAMMES PROPORTIONNELLES À LEUR DURÉE RÉELLE DANS LA TRANCHE HORAIRE
                         Row(
                             modifier = Modifier
                                 .horizontalScroll(horizontalScrollState)
                                 .fillMaxHeight(),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (progs.isEmpty()) {
-                                repeat(4) {
+                            if (visibleProgs.isEmpty()) {
+                                repeat(6) {
                                     Box(
                                         modifier = Modifier
-                                            .width(220.dp)
+                                            .width(slotWidthDp * 2) // 1 heure
                                             .fillMaxHeight()
-                                            .padding(2.dp)
+                                            .padding(1.dp)
                                             .clip(RoundedCornerShape(4.dp))
-                                            .background(Color(0xFF19202E))
+                                            .background(Color(0xFF181F2E))
                                             .clickable {
                                                 if (previewChannel?.id == ch.id) onPlayChannelFullscreen(ch)
                                                 else previewChannel = ch
@@ -1055,21 +1052,24 @@ fun TiviMateStyleGuideScreen(
                                     }
                                 }
                             } else {
-                                progs.forEach { prog ->
-                                    val durationMin = ((prog.stopTimestamp - prog.startTimestamp) / 60L).coerceIn(15L, 180L)
-                                    // Largeur proportionnelle à la durée de l'émission (30 min = 160.dp)
-                                    val boxWidth = (durationMin * 5.3f).dp.coerceAtLeast(110.dp)
-                                    val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp >= nowSec
-                                    val isPast = prog.stopTimestamp in 1 until nowSec
+                                visibleProgs.forEach { prog ->
+                                    // On tronque le début du programme s'il a commencé avant le début de la grille pour qu'il soit parfaitement aligné avec les heures en haut !
+                                    val effectiveStart = prog.startTimestamp.coerceAtLeast(timelineStartSec)
+                                    val effectiveStop = prog.stopTimestamp.coerceAtMost(timelineEndSec)
+                                    val effectiveMinutes = ((effectiveStop - effectiveStart) / 60L).coerceAtLeast(10L)
+                                    val boxWidth = (effectiveMinutes * dpPerMinute).dp
+
+                                    val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp > nowSec
+                                    val isPast = prog.stopTimestamp <= nowSec
                                     val canReplay = isPast && (ch.tvArchive == 1 || prog.hasArchive)
 
                                     Box(
                                         modifier = Modifier
                                             .width(boxWidth)
                                             .fillMaxHeight()
-                                            .padding(2.dp)
+                                            .padding(1.dp)
                                             .tvFocusableClick(
-                                                RoundedCornerShape(5.dp),
+                                                RoundedCornerShape(4.dp),
                                                 defaultBorderWidth = 1.dp,
                                                 defaultBorderColor = if (isCurrent) Color(0xFF38BDF8) else Color(0xFF262F40),
                                                 onFocused = {
@@ -1087,25 +1087,18 @@ fun TiviMateStyleGuideScreen(
                                                     }
                                                 }
                                             )
-                                            .background(if (isCurrent) Color(0xFF232D42) else Color(0xFF181F2E))
+                                            .background(if (isCurrent) Color(0xFF243046) else Color(0xFF181F2E))
                                             .padding(horizontal = 8.dp),
                                         contentAlignment = Alignment.CenterStart
                                     ) {
-                                        Column {
-                                            Text(
-                                                text = prog.title,
-                                                color = Color.White,
-                                                fontSize = 12.sp,
-                                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis
-                                            )
-                                            Text(
-                                                text = if (canReplay) "⏪ ${prog.startFormatted}" else "${prog.startFormatted} - ${prog.stopFormatted}",
-                                                color = if (canReplay) Color(0xFFA855F7) else Color(0xFF94A3B8),
-                                                fontSize = 10.sp
-                                            )
-                                        }
+                                        Text(
+                                            text = prog.title,
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
                                     }
                                 }
                             }
@@ -1118,15 +1111,11 @@ fun TiviMateStyleGuideScreen(
 }
 
 @Composable
-fun TiviCategoryRow(name: String, isSelected: Boolean, onClick: () -> Unit) {
+fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .tvFocusableClick(
-                RoundedCornerShape(6.dp),
-                defaultBorderWidth = 0.dp,
-                onClick = onClick
-            )
+            .tvFocusableClick(RoundedCornerShape(6.dp), defaultBorderWidth = 0.dp, onClick = onClick)
             .background(if (isSelected) Color(0xFFE2E8F0) else Color.Transparent)
             .padding(horizontal = 10.dp, vertical = 9.dp)
     ) {
@@ -1142,11 +1131,11 @@ fun TiviCategoryRow(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM "STYLE NETFLIX" : APERÇU VIDÉO DU FILM EN HAUT À DROITE EN DÉGRADÉ + BANDE-ANNONCE
+// 2. FICHE FILM AVEC VRAI DÉGRADÉ FLUIDE SANS CASSURE (TEXTURE_VIEW + 8 PALIERS)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun NetflixStyleMovieDetailScreen(
+fun MovieDetailScreen(
     movie: MediaEntry,
     details: VodDetails?,
     isLoading: Boolean,
@@ -1162,12 +1151,11 @@ fun NetflixStyleMovieDetailScreen(
     val context = LocalContext.current
     var isMuted by remember { mutableStateOf(false) }
 
-    // Lecteur d'extrait automatique du film (démarre à 8 minutes dans le film pour éviter le générique noir du début !)
     val previewPlayer = remember {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
             prepare()
-            seekTo(480_000L) // Extrait à 8 min
+            seekTo(480_000L) // Extrait à 8 min du film
             playWhenReady = true
             volume = 0.8f
         }
@@ -1182,58 +1170,57 @@ fun NetflixStyleMovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // COIN SUPÉRIEUR DROIT : EXTRAIT VIDÉO DU FILM EN DIRECT AVEC FONDU DÉGRADÉ COMME SUR NETFLIX !
+        // VIDÉO EN TEXTURE_VIEW SUR TOUTE LA LARGEUR AVEC DÉGRADÉ DOUX EN 8 PALIERS (ZÉRO BANDE NETTE !)
         Box(
             modifier = Modifier
-                .fillMaxWidth(0.65f)
-                .height(340.dp)
+                .fillMaxWidth()
+                .height(360.dp)
                 .align(Alignment.TopEnd)
         ) {
             AndroidView(
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
+                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                         player = previewPlayer
-                        useController = false
                         resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                     }
                 },
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Dégradé horizontal de gauche à droite (fond l'extrait vidéo dans le noir à gauche)
+            // Vrai dégradé horizontal multi-paliers ultra-progressif (de gauche à droite)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.horizontalGradient(
-                            colors = listOf(
-                                Color(0xFF0B0E14),
-                                Color(0xCC0B0E14),
-                                Color(0x440B0E14),
-                                Color.Transparent
-                            )
+                            0.00f to Color(0xFF0B0E14),
+                            0.22f to Color(0xFF0B0E14),
+                            0.35f to Color(0xE60B0E14),
+                            0.48f to Color(0xB30B0E14),
+                            0.62f to Color(0x660B0E14),
+                            0.78f to Color(0x220B0E14),
+                            1.00f to Color.Transparent
                         )
                     )
             )
 
-            // Dégradé vertical de haut en bas (fond le bas de la vidéo dans le noir de la page)
+            // Vrai dégradé vertical progressif (fond le haut et le bas dans le noir de la page)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            colors = listOf(
-                                Color(0x550B0E14),
-                                Color.Transparent,
-                                Color(0xCC0B0E14),
-                                Color(0xFF0B0E14)
-                            )
+                            0.00f to Color(0x880B0E14),
+                            0.25f to Color.Transparent,
+                            0.65f to Color(0x660B0E14),
+                            0.85f to Color(0xCC0B0E14),
+                            1.00f to Color(0xFF0B0E14)
                         )
                     )
             )
         }
 
-        // CONTENU DE LA FICHE FILM PAR-DESSUS LE DÉGRADÉ (À GAUCHE ET EN BAS)
+        // CONTENU DE LA FICHE FILM
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1254,7 +1241,6 @@ fun NetflixStyleMovieDetailScreen(
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        // Bouton activer/couper le son de l'extrait Netflix
                         IconButton(
                             onClick = {
                                 isMuted = !isMuted
@@ -1301,15 +1287,6 @@ fun NetflixStyleMovieDetailScreen(
                     )
 
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(4.dp))
-                                .background(Color(0xFFE50914))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
-                        ) {
-                            Text("APERÇU EN DIRECT", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold)
-                        }
-
                         Text(movie.title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
 
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1333,7 +1310,6 @@ fun NetflixStyleMovieDetailScreen(
                 }
             }
 
-            // BOUTONS D'ACTION : LIRE LE FILM, REPRENDRE, ET BANDE-ANNONCE YOUTUBE !
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1368,7 +1344,6 @@ fun NetflixStyleMovieDetailScreen(
                         }
                     }
 
-                    // BOUTON BANDE-ANNONCE (TRAILER)
                     Button(
                         onClick = {
                             previewPlayer.pause()
@@ -1384,7 +1359,6 @@ fun NetflixStyleMovieDetailScreen(
                 }
             }
 
-            // SYNOPSIS & CASTING
             item {
                 Column(
                     modifier = Modifier
@@ -1417,15 +1391,14 @@ fun NetflixStyleMovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE "STYLE NETFLIX" : EXTRAIT VIDÉO EN DÉGRADÉ EN HAUT À DROITE + BANDE-ANNONCE + SAISONS
+// 3. FICHE SÉRIE AVEC VRAI DÉGRADÉ FLUIDE + BANDE-ANNONCE + SAISONS
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
-fun NetflixStyleSeriesDetailScreen(
+fun SeriesDetailScreen(
     series: MediaEntry,
     episodes: List<EpisodeItem>,
     plot: String,
-    trailerCode: String,
     isLoading: Boolean,
     onBack: () -> Unit,
     onWatchTrailer: () -> Unit,
@@ -1448,13 +1421,12 @@ fun NetflixStyleSeriesDetailScreen(
         }
     }
 
-    // Dès que les épisodes sont chargés, on joue un extrait du 1er épisode dans le coin supérieur droit en dégradé !
     LaunchedEffect(episodes.firstOrNull()?.streamUrl) {
         val firstUrl = episodes.firstOrNull()?.streamUrl
         if (!firstUrl.isNullOrBlank()) {
             previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(firstUrl)))
             previewPlayer.prepare()
-            previewPlayer.seekTo(180_000L) // Extrait à 3 min
+            previewPlayer.seekTo(180_000L)
             previewPlayer.playWhenReady = true
         }
     }
@@ -1468,18 +1440,16 @@ fun NetflixStyleSeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // COIN SUPÉRIEUR DROIT : EXTRAIT VIDÉO DE LA SÉRIE EN DÉGRADÉ
         Box(
             modifier = Modifier
-                .fillMaxWidth(0.62f)
-                .height(290.dp)
+                .fillMaxWidth()
+                .height(320.dp)
                 .align(Alignment.TopEnd)
         ) {
             AndroidView(
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
+                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                         player = previewPlayer
-                        useController = false
                         resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                     }
                 },
@@ -1490,7 +1460,11 @@ fun NetflixStyleSeriesDetailScreen(
                     .fillMaxSize()
                     .background(
                         Brush.horizontalGradient(
-                            listOf(Color(0xFF0B0E14), Color(0xCC0B0E14), Color.Transparent)
+                            0.00f to Color(0xFF0B0E14),
+                            0.25f to Color(0xFF0B0E14),
+                            0.45f to Color(0xCC0B0E14),
+                            0.70f to Color(0x550B0E14),
+                            1.00f to Color.Transparent
                         )
                     )
             )
@@ -1499,7 +1473,10 @@ fun NetflixStyleSeriesDetailScreen(
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            listOf(Color.Transparent, Color(0xCC0B0E14), Color(0xFF0B0E14))
+                            0.00f to Color(0x660B0E14),
+                            0.40f to Color.Transparent,
+                            0.80f to Color(0xCC0B0E14),
+                            1.00f to Color(0xFF0B0E14)
                         )
                     )
             )
@@ -1515,19 +1492,18 @@ fun NetflixStyleSeriesDetailScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     IconButton(onClick = onBack) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                     }
                     Column {
                         Text(series.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
                         if (plot.isNotBlank()) {
-                            Text(plot, color = Color(0xFFCBD5E1), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth(0.75f))
+                            Text(plot, color = Color(0xFFCBD5E1), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
 
-                // Bouton Bande-annonce Série
                 Button(
                     onClick = {
                         previewPlayer.pause()
@@ -1587,13 +1563,13 @@ fun NetflixStyleSeriesDetailScreen(
 }
 
 @Composable
-fun HomeProDashboard(
+fun HomeDashboard(
     liveChannels: List<MediaEntry>,
     vodMovies: List<MediaEntry>,
     seriesList: List<MediaEntry>,
     resumeItems: List<MediaEntry>,
     prefs: android.content.SharedPreferences,
-    epgNowCache: Map<String, List<EpgProgram>>,
+    epgCache: Map<String, List<EpgProgram>>,
     onRequestEpg: (String) -> Unit,
     onSelectMedia: (MediaEntry) -> Unit,
     onSelectTab: (Int) -> Unit
@@ -1635,13 +1611,13 @@ fun HomeProDashboard(
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
-                                text = "NEO TV 5.0 • GRILLE TIVIMATE • APERÇUS NETFLIX • BANDES-ANNONCES",
+                                text = "À L'AFFICHE • ${liveChannels.size} CHAÎNES • ${vodMovies.size} FILMS • ${seriesList.size} SÉRIES",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = featured?.title ?: "Bienvenue sur NeoTV 5.0",
+                                text = featured?.title ?: "Bienvenue sur NeoTV",
                                 color = Color.White,
                                 fontSize = 21.sp,
                                 fontWeight = FontWeight.ExtraBold,
@@ -1649,7 +1625,7 @@ fun HomeProDashboard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "${liveChannels.size} Chaînes • ${vodMovies.size} Films • ${seriesList.size} Séries",
+                                text = "Direct TV • Guide des programmes • Films & Séries à la demande",
                                 color = Color(0xFFCBD5E1),
                                 fontSize = 12.sp
                             )
@@ -1662,7 +1638,7 @@ fun HomeProDashboard(
                             ) {
                                 Icon(Icons.Default.LiveTv, contentDescription = null, tint = Color.White)
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Ouvrir Grille TiviMate", color = Color.White, fontWeight = FontWeight.Bold)
+                                Text("TV en direct", color = Color.White, fontWeight = FontWeight.Bold)
                             }
                             Button(
                                 onClick = { if (featured != null) onSelectMedia(featured) },
@@ -1671,7 +1647,7 @@ fun HomeProDashboard(
                             ) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("À l'affiche", color = Color.Black, fontWeight = FontWeight.Bold)
+                                Text("Regarder", color = Color.Black, fontWeight = FontWeight.Bold)
                             }
                         }
                     }
@@ -1729,7 +1705,7 @@ fun HomeProDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Films à l'affiche (Aperçu vidéo Netflix & Bandes-annonces)", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Films à l'affiche", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(2) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -1748,7 +1724,7 @@ fun HomeProDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Séries Complètes", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Séries", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(3) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -1869,6 +1845,8 @@ fun UltimateVideoPlayerScreen(
         }
     }
 
+    val nowSec = System.currentTimeMillis() / 1000L
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -1920,7 +1898,7 @@ fun UltimateVideoPlayerScreen(
                         }
                         Column {
                             Text(text = media.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            val currentEpg = epgList.firstOrNull()
+                            val currentEpg = epgList.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec } ?: epgList.firstOrNull()
                             if (currentEpg != null) {
                                 Text(
                                     text = "${currentEpg.startFormatted}-${currentEpg.stopFormatted} : ${currentEpg.title}",
@@ -1950,7 +1928,7 @@ fun UltimateVideoPlayerScreen(
                         )
                         if (media.type == "LIVE") {
                             SmallControlChip(
-                                label = "📅 EPG & Replay",
+                                label = "📅 Guide & Replay",
                                 isActive = showEpgDrawer,
                                 onClick = {
                                     wakeUpControls()
@@ -1961,7 +1939,7 @@ fun UltimateVideoPlayerScreen(
                         }
                         if (liveChannelList.isNotEmpty()) {
                             SmallControlChip(
-                                label = if (showZappingDrawer) "Fermer" else "📺 Zapping",
+                                label = if (showZappingDrawer) "Fermer" else "📺 Chaînes",
                                 isActive = showZappingDrawer,
                                 onClick = {
                                     wakeUpControls()
@@ -1985,7 +1963,7 @@ fun UltimateVideoPlayerScreen(
                         SmallControlChip(label = "⏩ +15s", onClick = { seekLiveOrTimeshift(15) })
                         if (isReplayMode || liveTimeshiftMinutes < 0) {
                             SmallControlChip(
-                                label = "🔴 Revenir au Direct",
+                                label = "🔴 Direct",
                                 isActive = true,
                                 onClick = {
                                     liveTimeshiftMinutes = 0
@@ -2037,7 +2015,6 @@ fun UltimateVideoPlayerScreen(
         }
 
         if (showEpgDrawer) {
-            val nowSec = System.currentTimeMillis() / 1000L
             Box(
                 modifier = Modifier
                     .fillMaxHeight()
@@ -2052,7 +2029,7 @@ fun UltimateVideoPlayerScreen(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     item {
-                        Text("Programmation & Replay", color = Color(0xFF38BDF8), fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        Text("Guide TV & Replay", color = Color(0xFF38BDF8), fontSize = 15.sp, fontWeight = FontWeight.Bold)
                     }
                     items(epgList) { prog ->
                         val isPast = prog.stopTimestamp in 1 until nowSec
@@ -2316,7 +2293,7 @@ fun IptvSetupScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Text("Paramètres Xtream Codes & Abonnement", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("Paramètres & Abonnement", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
 
         item {
@@ -2380,7 +2357,7 @@ fun IptvSetupScreen(
     }
 }
 
-// --- MOTEUR RÉSEAU XTREAM CODES ---
+// --- MOTEUR RÉSEAU XTREAM CODES & CALIBRAGE EXACT DES HORAIRES EPG ---
 
 suspend fun fetchAccountInfo(baseUrl: String, user: String, pass: String): AccountInfo = withContext(Dispatchers.IO) {
     try {
@@ -2445,7 +2422,7 @@ suspend fun fetchXtreamLive(
         val catId = obj.optString("category_id")
         val tvArchive = obj.optInt("tv_archive", 0)
         val tvArchiveDur = obj.optInt("tv_archive_duration", 0)
-        val catName = catMap[catId] ?: "Direct TV"
+        val catName = catMap[catId] ?: "TV"
         val url = "$cleanBase/live/$user/$pass/$id.ts"
         list.add(MediaEntry(id, name, catId, catName, logo, url, "LIVE", tvArchive, tvArchiveDur))
     }
@@ -2568,38 +2545,50 @@ suspend fun fetchSeriesEpisodesAndInfo(
     }
 }
 
+// Lecture et calibrage intelligent de l'EPG (corrige les fuseaux horaires et trie par heure exacte)
 suspend fun fetchChannelEpgList(
     baseUrl: String,
     user: String,
     pass: String,
-    streamId: String,
-    limit: Int = 25
+    streamId: String
 ): List<EpgProgram> = withContext(Dispatchers.IO) {
     try {
         val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-        val action = if (limit > 10) "get_simple_data_table" else "get_short_epg"
-        val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=$action&stream_id=$streamId&limit=$limit")
+        val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_simple_data_table&stream_id=$streamId")
         val obj = JSONObject(json)
         val arr = obj.optJSONArray("epg_listings") ?: return@withContext emptyList()
         val list = mutableListOf<EpgProgram>()
+
         val timeFormat = SimpleDateFormat("HH:mm", Locale.FRANCE)
+        val dateParser = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply {
+            timeZone = TimeZone.getDefault()
+        }
 
         for (i in 0 until arr.length()) {
             val item = arr.getJSONObject(i)
             val title = decodeBase64IfPossible(item.optString("title", ""))
             val desc = decodeBase64IfPossible(item.optString("description", ""))
-            val startTs = item.optString("start_timestamp", "0").toLongOrNull() ?: 0L
-            val stopTs = item.optString("stop_timestamp", "0").toLongOrNull() ?: 0L
+
+            val startStrRaw = item.optString("start", "")
+            val endStrRaw = item.optString("end", "")
+
+            val startTs = item.optString("start_timestamp", "").toLongOrNull()
+                ?: runCatching { dateParser.parse(startStrRaw)?.time?.div(1000L) }.getOrNull()
+                ?: 0L
+            val stopTs = item.optString("stop_timestamp", "").toLongOrNull()
+                ?: runCatching { dateParser.parse(endStrRaw)?.time?.div(1000L) }.getOrNull()
+                ?: 0L
+
             val hasArchive = item.optInt("has_archive", 0) == 1
 
-            val startStr = if (startTs > 0) timeFormat.format(Date(startTs * 1000L)) else ""
-            val stopStr = if (stopTs > 0) timeFormat.format(Date(stopTs * 1000L)) else ""
+            val startFormatted = if (startTs > 0) timeFormat.format(Date(startTs * 1000L)) else ""
+            val stopFormatted = if (stopTs > 0) timeFormat.format(Date(stopTs * 1000L)) else ""
 
-            if (title.isNotBlank()) {
-                list.add(EpgProgram(title, desc, startTs, stopTs, startStr, stopStr, hasArchive))
+            if (title.isNotBlank() && stopTs > startTs) {
+                list.add(EpgProgram(title, desc, startTs, stopTs, startFormatted, stopFormatted, hasArchive))
             }
         }
-        list
+        list.sortedBy { it.startTimestamp }
     } catch (e: Exception) {
         emptyList()
     }
@@ -2635,7 +2624,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTVV5/5.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/5.1 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
