@@ -1,6 +1,7 @@
 package com.neotv.app
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
@@ -11,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -22,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -66,6 +69,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -74,7 +78,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // MASQUER LA BARRE DES TÂCHES / STATUT EN HAUT DU TÉLÉPHONE (Mode Immersif Total)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->
             controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -90,15 +93,14 @@ class MainActivity : ComponentActivity() {
                     primary = Color(0xFF8B5CF6)
                 )
             ) {
-                NeoTvUltimateApp()
+                NeoTvV5App()
             }
         }
     }
 }
 
-// MODIFICATEUR SPÉCIAL ANDROID TV & TACTILE : Affiche un contour lumineux Cyan/Blanc très visible à la télécommande !
 fun Modifier.tvFocusableClick(
-    shape: RoundedCornerShape = RoundedCornerShape(12.dp),
+    shape: RoundedCornerShape = RoundedCornerShape(10.dp),
     defaultBorderWidth: Dp = 1.dp,
     defaultBorderColor: Color = Color(0xFF262F40),
     onFocused: () -> Unit = {},
@@ -112,7 +114,7 @@ fun Modifier.tvFocusableClick(
             color = if (isFocused) Color(0xFF38BDF8) else defaultBorderColor,
             shape = shape
         )
-        .background(if (isFocused) Color(0xFF232D42) else Color.Transparent)
+        .background(if (isFocused) Color(0xFF28354E) else Color.Transparent)
         .onFocusChanged {
             isFocused = it.isFocused
             if (it.isFocused) onFocused()
@@ -129,8 +131,9 @@ data class MediaEntry(
     val logoUrl: String,
     val streamUrl: String,
     val type: String, // "LIVE", "VOD", "SERIES"
-    val tvArchive: Int = 0, // 1 si la chaîne supporte le Replay / Retour en arrière
-    val tvArchiveDuration: Int = 0
+    val tvArchive: Int = 0,
+    val tvArchiveDuration: Int = 0,
+    val trailerId: String = ""
 )
 
 data class CategoryItem(
@@ -162,7 +165,9 @@ data class VodDetails(
     val genre: String,
     val releaseDate: String,
     val duration: String,
-    val rating: String
+    val rating: String,
+    val backdropUrl: String,
+    val youtubeTrailer: String
 )
 
 data class EpisodeItem(
@@ -179,8 +184,26 @@ data class TrackOption(
     val isSelected: Boolean
 )
 
+fun openTrailerYoutube(context: Context, title: String, youtubeCode: String) {
+    val clean = youtubeCode.trim()
+    val url = when {
+        clean.startsWith("http") -> clean
+        clean.isNotBlank() && clean != "null" -> "https://www.youtube.com/watch?v=$clean"
+        else -> {
+            val query = URLEncoder.encode("$title bande annonce VF trailer", "UTF-8")
+            "https://www.youtube.com/results?search_query=$query"
+        }
+    }
+    try {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {}
+}
+
 @Composable
-fun NeoTvUltimateApp() {
+fun NeoTvV5App() {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
@@ -208,13 +231,12 @@ fun NeoTvUltimateApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
-    var epgNowCache by remember { mutableStateOf<Map<String, List<EpgProgram>>>(emptyMap()) }
+    var epgCache by remember { mutableStateOf<Map<String, List<EpgProgram>>>(emptyMap()) }
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    // MÉMORISATION DE LA NAVIGATION (Pour que le bouton Retour ne ramène JAMAIS à l'accueil par erreur !)
     var selectedTab by rememberSaveable { mutableStateOf(0) }
     var selectedCatId by rememberSaveable { mutableStateOf("ALL") }
     var searchQuery by rememberSaveable { mutableStateOf("") }
@@ -223,14 +245,9 @@ fun NeoTvUltimateApp() {
 
     var showSettings by remember { mutableStateOf(false) }
 
-    // États des écrans enfants
     var playingMedia by remember { mutableStateOf<MediaEntry?>(null) }
     var customStreamOverride by remember { mutableStateOf<String?>(null) }
     var startPositionMs by remember { mutableStateOf(0L) }
-
-    var channelForFullEpg by remember { mutableStateOf<MediaEntry?>(null) }
-    var fullEpgPrograms by remember { mutableStateOf<List<EpgProgram>>(emptyList()) }
-    var isFullEpgLoading by remember { mutableStateOf(false) }
 
     var selectedMovieForDetails by remember { mutableStateOf<MediaEntry?>(null) }
     var movieDetails by remember { mutableStateOf<VodDetails?>(null) }
@@ -238,6 +255,8 @@ fun NeoTvUltimateApp() {
 
     var selectedSeries by remember { mutableStateOf<MediaEntry?>(null) }
     var seriesEpisodes by remember { mutableStateOf<List<EpisodeItem>>(emptyList()) }
+    var seriesTrailer by remember { mutableStateOf("") }
+    var seriesPlot by remember { mutableStateOf("") }
     var isSeriesLoading by remember { mutableStateOf(false) }
 
     fun toggleFavorite(id: String) {
@@ -260,21 +279,12 @@ fun NeoTvUltimateApp() {
     }
 
     fun loadEpgForChannel(streamId: String) {
-        if (serverUrl.isBlank() || epgNowCache.containsKey(streamId)) return
+        if (serverUrl.isBlank() || epgCache.containsKey(streamId)) return
         scope.launch {
-            val progs = fetchChannelEpgList(serverUrl, username, password, streamId, limit = 6)
+            val progs = fetchChannelEpgList(serverUrl, username, password, streamId, limit = 25)
             if (progs.isNotEmpty()) {
-                epgNowCache = epgNowCache + (streamId to progs)
+                epgCache = epgCache + (streamId to progs)
             }
-        }
-    }
-
-    fun openFullEpgModal(channel: MediaEntry) {
-        channelForFullEpg = channel
-        isFullEpgLoading = true
-        scope.launch {
-            fullEpgPrograms = fetchChannelEpgList(serverUrl, username, password, channel.id, limit = 50)
-            isFullEpgLoading = false
         }
     }
 
@@ -287,7 +297,7 @@ fun NeoTvUltimateApp() {
                 statusText = "Vérification de l'abonnement Xtream..."
                 accountInfo = fetchAccountInfo(serverUrl, username, password)
 
-                statusText = "Synchronisation Direct TV & Replay..."
+                statusText = "Synchronisation Direct TV & Grille EPG..."
                 val liveRes = fetchXtreamLive(context, serverUrl, username, password, forceRefresh)
                 liveCategories = liveRes.first
                 liveChannels = liveRes.second
@@ -314,11 +324,10 @@ fun NeoTvUltimateApp() {
         loadAllXtreamData(forceRefresh = false)
     }
 
-    // GESTION DES ÉCRANS AVEC PILE DE RETOUR PROPRE (Étape par étape)
     when {
         playingMedia != null -> {
             val currentMedia = playingMedia!!
-            val progs = epgNowCache[currentMedia.id] ?: emptyList()
+            val progs = epgCache[currentMedia.id] ?: emptyList()
             UltimateVideoPlayerScreen(
                 media = currentMedia,
                 streamUrlToPlay = customStreamOverride ?: currentMedia.streamUrl,
@@ -341,9 +350,7 @@ fun NeoTvUltimateApp() {
                     val replayUrl = buildCatchupUrl(serverUrl, username, password, currentMedia.id, prog.startTimestamp, prog.stopTimestamp)
                     customStreamOverride = replayUrl
                 },
-                onReturnToLive = {
-                    customStreamOverride = null
-                },
+                onReturnToLive = { customStreamOverride = null },
                 onSaveProgress = { pos, dur ->
                     if (currentMedia.type != "LIVE") {
                         saveWatchProgress(currentMedia.id, pos, dur)
@@ -355,30 +362,10 @@ fun NeoTvUltimateApp() {
                 }
             )
         }
-        channelForFullEpg != null -> {
-            val ch = channelForFullEpg!!
-            FullEpgAndReplayScreen(
-                channel = ch,
-                programs = fullEpgPrograms,
-                isLoading = isFullEpgLoading,
-                onPlayLive = {
-                    channelForFullEpg = null
-                    customStreamOverride = null
-                    playingMedia = ch
-                },
-                onPlayReplay = { prog ->
-                    val replayUrl = buildCatchupUrl(serverUrl, username, password, ch.id, prog.startTimestamp, prog.stopTimestamp)
-                    channelForFullEpg = null
-                    customStreamOverride = replayUrl
-                    playingMedia = ch
-                },
-                onBack = { channelForFullEpg = null }
-            )
-        }
         selectedMovieForDetails != null -> {
             val movie = selectedMovieForDetails!!
             val savedPos = prefs.getLong("pos_${movie.id}", 0L)
-            MovieDetailScreen(
+            NetflixStyleMovieDetailScreen(
                 movie = movie,
                 details = movieDetails,
                 isLoading = isMovieDetailsLoading,
@@ -395,24 +382,34 @@ fun NeoTvUltimateApp() {
                     customStreamOverride = null
                     playingMedia = movie
                 },
+                onWatchTrailer = {
+                    val trailerCode = movieDetails?.youtubeTrailer?.ifBlank { movie.trailerId } ?: movie.trailerId
+                    openTrailerYoutube(context, movie.title, trailerCode)
+                },
                 onBack = { selectedMovieForDetails = null }
             )
         }
         selectedSeries != null -> {
-            SeriesDetailScreen(
-                series = selectedSeries!!,
+            val serie = selectedSeries!!
+            NetflixStyleSeriesDetailScreen(
+                series = serie,
                 episodes = seriesEpisodes,
+                plot = seriesPlot,
+                trailerCode = seriesTrailer.ifBlank { serie.trailerId },
                 isLoading = isSeriesLoading,
                 onBack = { selectedSeries = null },
+                onWatchTrailer = {
+                    openTrailerYoutube(context, serie.title, seriesTrailer.ifBlank { serie.trailerId })
+                },
                 onPlayEpisode = { ep ->
                     startPositionMs = prefs.getLong("pos_ep_${ep.id}", 0L)
                     customStreamOverride = null
                     playingMedia = MediaEntry(
                         id = "ep_${ep.id}",
-                        title = "${selectedSeries!!.title} - S${ep.season} : ${ep.title}",
+                        title = "${serie.title} - S${ep.season} : ${ep.title}",
                         categoryId = "",
                         categoryName = "Série",
-                        logoUrl = selectedSeries!!.logoUrl,
+                        logoUrl = serie.logoUrl,
                         streamUrl = ep.streamUrl,
                         type = "VOD"
                     )
@@ -441,7 +438,6 @@ fun NeoTvUltimateApp() {
             )
         }
         else -> {
-            // Si on est dans un onglet autre qu'Accueil (ex: Direct TV, Films, Séries), le bouton Retour de la télécommande ramène d'abord à l'Accueil au lieu de fermer l'application
             BackHandler(enabled = selectedTab != 0 || selectedCatId != "ALL" || searchQuery.isNotEmpty()) {
                 when {
                     searchQuery.isNotEmpty() -> searchQuery = ""
@@ -480,22 +476,29 @@ fun NeoTvUltimateApp() {
                 resumeItems = resumeItems,
                 prefs = prefs,
                 favorites = favorites,
-                epgNowCache = epgNowCache,
+                epgCache = epgCache,
                 isLoading = isLoading,
                 statusText = statusText,
                 errorMsg = errorMsg,
                 onToggleFav = { toggleFavorite(it) },
                 onRequestEpg = { loadEpgForChannel(it) },
-                onOpenFullEpg = { openFullEpgModal(it) },
                 onRefreshCatalog = { loadAllXtreamData(forceRefresh = true) },
                 onOpenSettings = { showSettings = true },
+                onPlayReplayFromGrid = { ch, prog ->
+                    val replayUrl = buildCatchupUrl(serverUrl, username, password, ch.id, prog.startTimestamp, prog.stopTimestamp)
+                    customStreamOverride = replayUrl
+                    playingMedia = ch
+                },
                 onSelectMedia = { entry ->
                     when (entry.type) {
                         "SERIES" -> {
                             selectedSeries = entry
                             isSeriesLoading = true
                             scope.launch {
-                                seriesEpisodes = fetchSeriesEpisodes(serverUrl, username, password, entry.id)
+                                val info = fetchSeriesEpisodesAndInfo(serverUrl, username, password, entry.id)
+                                seriesEpisodes = info.first
+                                seriesPlot = info.second
+                                seriesTrailer = info.third
                                 isSeriesLoading = false
                             }
                         }
@@ -542,18 +545,18 @@ fun MainNeoProScreen(
     resumeItems: List<MediaEntry>,
     prefs: android.content.SharedPreferences,
     favorites: Set<String>,
-    epgNowCache: Map<String, List<EpgProgram>>,
+    epgCache: Map<String, List<EpgProgram>>,
     isLoading: Boolean,
     statusText: String,
     errorMsg: String?,
     onToggleFav: (String) -> Unit,
     onRequestEpg: (String) -> Unit,
-    onOpenFullEpg: (MediaEntry) -> Unit,
     onRefreshCatalog: () -> Unit,
     onOpenSettings: () -> Unit,
+    onPlayReplayFromGrid: (MediaEntry, EpgProgram) -> Unit,
     onSelectMedia: (MediaEntry) -> Unit
 ) {
-    val tabs = listOf("Accueil", "Direct TV", "Films", "Séries", "Favoris")
+    val tabs = listOf("Accueil", "Guide TV (TiviMate)", "Films", "Séries", "Favoris")
 
     val currentCategories = when (selectedTab) {
         1 -> liveCategories
@@ -564,14 +567,14 @@ fun MainNeoProScreen(
 
     val currentList = remember(selectedTab, liveChannels, vodMovies, seriesList, favorites, selectedCatId, searchQuery) {
         val base = when (selectedTab) {
-            1 -> liveChannels
+            1 -> if (selectedCatId == "FAV") liveChannels.filter { favorites.contains(it.id) } else liveChannels
             2 -> vodMovies
             3 -> seriesList
             4 -> (liveChannels + vodMovies + seriesList).filter { favorites.contains(it.id) }
             else -> liveChannels
         }
         base.filter { item ->
-            val matchCat = selectedCatId == "ALL" || item.categoryId == selectedCatId
+            val matchCat = selectedCatId == "ALL" || selectedCatId == "FAV" || item.categoryId == selectedCatId
             val matchSearch = searchQuery.isBlank() || item.title.contains(searchQuery, ignoreCase = true)
             matchCat && matchSearch
         }
@@ -581,126 +584,116 @@ fun MainNeoProScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
-            .padding(horizontal = 16.dp, vertical = 10.dp)
+            .padding(horizontal = 14.dp, vertical = 8.dp)
     ) {
-        // BARRE SUPÉRIEURE AVEC STATUT ABONNEMENT
+        // BARRE SUPÉRIEURE
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("NEO", color = Color(0xFF38BDF8), fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
-                Text(" TV 4.0", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Light)
+                Text("NEO", color = Color(0xFF38BDF8), fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                Text(" TV 5.0", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Light)
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            LazyRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
+            ) {
+                itemsIndexed(tabs) { index, tab ->
+                    val isSelected = selectedTab == index
+                    Box(
+                        modifier = Modifier
+                            .tvFocusableClick(CircleShape, onClick = { onChangeTab(index) })
+                            .background(if (isSelected) Color(0xFF8B5CF6) else Color(0xFF151A24))
+                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = tab,
+                            color = if (isSelected) Color.White else Color(0xFF94A3B8),
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
                         .tvFocusableClick(CircleShape, onClick = onRefreshCatalog)
                         .background(Color(0xFF151A24))
-                        .padding(8.dp)
+                        .padding(7.dp)
                 ) {
-                    Icon(Icons.Default.Refresh, contentDescription = "Actualiser", tint = Color(0xFF38BDF8), modifier = Modifier.size(18.dp))
+                    Icon(Icons.Default.Refresh, contentDescription = "Actualiser", tint = Color(0xFF38BDF8), modifier = Modifier.size(16.dp))
                 }
 
                 Box(
                     modifier = Modifier
                         .tvFocusableClick(CircleShape, onClick = onOpenSettings)
                         .background(Color(0xFF8B5CF6))
-                        .padding(horizontal = 14.dp, vertical = 7.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Settings, contentDescription = null, tint = Color.White, modifier = Modifier.size(15.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (liveChannels.isEmpty()) "Connecter IPTV" else "Exp: ${accountInfo.expDateFormatted}",
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // MENU DES ONGLETS COMPATIBLE TÉLÉCOMMANDE TV
-        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            itemsIndexed(tabs) { index, tab ->
-                val isSelected = selectedTab == index
-                val countBadge = when (index) {
-                    1 -> if (liveChannels.isNotEmpty()) " (${liveChannels.size})" else ""
-                    2 -> if (vodMovies.isNotEmpty()) " (${vodMovies.size})" else ""
-                    3 -> if (seriesList.isNotEmpty()) " (${seriesList.size})" else ""
-                    4 -> if (favorites.isNotEmpty()) " (${favorites.size})" else ""
-                    else -> ""
-                }
-                Box(
-                    modifier = Modifier
-                        .tvFocusableClick(CircleShape, onClick = { onChangeTab(index) })
-                        .background(if (isSelected) Color(0xFF8B5CF6) else Color(0xFF151A24))
-                        .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = "$tab$countBadge",
-                        color = if (isSelected) Color.White else Color(0xFF94A3B8),
-                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                        fontSize = 13.sp
+                        text = if (liveChannels.isEmpty()) "IPTV" else "Exp: ${accountInfo.expDateFormatted}",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         if (isLoading) {
             Row(
-                modifier = Modifier.fillMaxWidth().padding(6.dp),
+                modifier = Modifier.fillMaxWidth().padding(4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                CircularProgressIndicator(color = Color(0xFF38BDF8), modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(10.dp))
+                CircularProgressIndicator(color = Color(0xFF38BDF8), modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(statusText, color = Color(0xFF38BDF8), fontSize = 12.sp)
             }
         }
 
         errorMsg?.let {
-            Text(it, color = Color(0xFFEF4444), fontSize = 12.sp, modifier = Modifier.padding(4.dp))
+            Text(it, color = Color(0xFFEF4444), fontSize = 12.sp)
         }
 
-        // BARRE DE RECHERCHE
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = onChangeSearch,
-            placeholder = { Text("Rechercher une chaîne, un film ou une série...", color = Color(0xFF64748B), fontSize = 13.sp) },
-            leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF38BDF8)) },
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { onChangeSearch("") }) {
-                        Icon(Icons.Default.Clear, contentDescription = "Effacer", tint = Color.Gray)
+        // Si on n'est pas sur la grille TiviMate (qui a sa propre colonne de catégories à gauche), on affiche la barre de recherche et de catégories
+        if (selectedTab != 1) {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = onChangeSearch,
+                placeholder = { Text("Rechercher une chaîne, un film ou une série...", color = Color(0xFF64748B), fontSize = 12.sp) },
+                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF38BDF8)) },
+                trailingIcon = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { onChangeSearch("") }) {
+                            Icon(Icons.Default.Clear, contentDescription = "Effacer", tint = Color.Gray)
+                        }
                     }
-                }
-            },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
-        )
+                },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(12.dp)
+            )
 
-        Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
-        // BARRE DES CATÉGORIES
-        if (currentCategories.isNotEmpty()) {
-            LazyRow(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.padding(bottom = 8.dp)
-            ) {
-                item {
-                    CategoryChip("Tout (${currentList.size})", selectedCatId == "ALL") { onChangeCategory("ALL") }
-                }
-                items(currentCategories) { cat ->
-                    CategoryChip(cat.name, selectedCatId == cat.id) { onChangeCategory(cat.id) }
+            if (currentCategories.isNotEmpty()) {
+                LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.padding(bottom = 6.dp)
+                ) {
+                    item {
+                        CategoryChip("Tout (${currentList.size})", selectedCatId == "ALL") { onChangeCategory("ALL") }
+                    }
+                    items(currentCategories) { cat ->
+                        CategoryChip(cat.name, selectedCatId == cat.id) { onChangeCategory(cat.id) }
+                    }
                 }
             }
         }
@@ -713,22 +706,25 @@ fun MainNeoProScreen(
                     seriesList = seriesList.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     resumeItems = resumeItems,
                     prefs = prefs,
-                    epgNowCache = epgNowCache,
+                    epgNowCache = epgCache,
                     onRequestEpg = onRequestEpg,
                     onSelectMedia = onSelectMedia,
                     onSelectTab = onChangeTab
                 )
             }
             1 -> {
-                LiveChannelsList(
-                    listState = liveListState,
+                // LA VRAIE GRILLE TV MULTI-HEURES FAÇON TIVIMATE (COMME SUR VOTRE PHOTO !)
+                TiviMateStyleGuideScreen(
+                    categories = liveCategories,
+                    selectedCatId = selectedCatId,
+                    onSelectCategory = onChangeCategory,
                     channels = currentList,
                     favorites = favorites,
-                    epgNowCache = epgNowCache,
-                    onToggleFav = onToggleFav,
+                    epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
-                    onOpenFullEpg = onOpenFullEpg,
-                    onPlayMedia = onSelectMedia
+                    onToggleFav = onToggleFav,
+                    onPlayChannelFullscreen = onSelectMedia,
+                    onPlayReplayProgram = onPlayReplayFromGrid
                 )
             }
             2, 3 -> {
@@ -741,21 +737,849 @@ fun MainNeoProScreen(
                 )
             }
             4 -> {
-                if (currentList.isEmpty()) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Aucun favori. Appuyez sur ⭐ sur vos chaînes ou films préférés !", color = Color(0xFF94A3B8))
-                    }
-                } else {
-                    LiveChannelsList(
-                        listState = liveListState,
-                        channels = currentList,
-                        favorites = favorites,
-                        epgNowCache = epgNowCache,
-                        onToggleFav = onToggleFav,
-                        onRequestEpg = onRequestEpg,
-                        onOpenFullEpg = onOpenFullEpg,
-                        onPlayMedia = onSelectMedia
+                PosterGrid(
+                    gridState = gridState,
+                    items = currentList,
+                    favorites = favorites,
+                    onToggleFav = onToggleFav,
+                    onPlayMedia = onSelectMedia
+                )
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 1. LA VRAIE GRILLE TV FAÇON TIVIMATE (AVEC MINI-LECTEUR + TIMELINE HORIZONTALE)
+// =========================================================================
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun TiviMateStyleGuideScreen(
+    categories: List<CategoryItem>,
+    selectedCatId: String,
+    onSelectCategory: (String) -> Unit,
+    channels: List<MediaEntry>,
+    favorites: Set<String>,
+    epgCache: Map<String, List<EpgProgram>>,
+    onRequestEpg: (String) -> Unit,
+    onToggleFav: (String) -> Unit,
+    onPlayChannelFullscreen: (MediaEntry) -> Unit,
+    onPlayReplayProgram: (MediaEntry, EpgProgram) -> Unit
+) {
+    val context = LocalContext.current
+    var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
+    var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
+
+    // Mini-lecteur ExoPlayer pour l'aperçu vidéo en haut à gauche (comme sur TiviMate)
+    val miniPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 1f
+        }
+    }
+
+    LaunchedEffect(previewChannel?.streamUrl) {
+        val url = previewChannel?.streamUrl
+        if (!url.isNullOrBlank()) {
+            miniPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
+            miniPlayer.prepare()
+            miniPlayer.playWhenReady = true
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { miniPlayer.release() }
+    }
+
+    val nowSec = System.currentTimeMillis() / 1000L
+    // Début de la grille calé sur la demi-heure précédente (ex: 21:00 ou 21:30)
+    val baseTimelineSec = remember { (nowSec / 1800L) * 1800L - 1800L }
+    val timeSlots = remember(baseTimelineSec) {
+        val sdf = SimpleDateFormat("HH:mm", Locale.FRANCE)
+        (0..8).map { idx ->
+            val slotSec = baseTimelineSec + idx * 1800L
+            sdf.format(Date(slotSec * 1000L))
+        }
+    }
+    val dateHeader = remember {
+        SimpleDateFormat("EEE d MMM, HH:mm", Locale.FRANCE).format(Date())
+    }
+
+    val horizontalScrollState = rememberScrollState()
+
+    Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
+        // COLONNE GAUCHE : CATÉGORIES (Favoris, Toutes les chaînes, FRANCE HD, CINEMA HD...)
+        LazyColumn(
+            modifier = Modifier
+                .width(165.dp)
+                .fillMaxHeight()
+                .background(Color(0xFF0E131B))
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            item {
+                TiviCategoryRow("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV") }
+            }
+            item {
+                TiviCategoryRow("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL") }
+            }
+            items(categories) { cat ->
+                TiviCategoryRow(cat.name, selectedCatId == cat.id) { onSelectCategory(cat.id) }
+            }
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        // PARTIE DROITE : HAUT (MINI-LECTEUR + DESCRIPTION PROGRAMME) & BAS (GRILLE HORIZONTALE)
+        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            // HAUT : APERÇU VIDÉO EN DIRECT + DÉTAILS DU PROGRAMME SÉLECTIONNÉ (Exactement comme la photo TiviMate)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(135.dp)
+                    .background(Color(0xFF111622))
+                    .clip(RoundedCornerShape(10.dp))
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                // Mini-écran TV cliquable (1 clic sur la miniature = passage en plein écran)
+                Box(
+                    modifier = Modifier
+                        .width(210.dp)
+                        .fillMaxHeight()
+                        .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                            previewChannel?.let { onPlayChannelFullscreen(it) }
+                        })
+                        .background(Color.Black)
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                player = miniPlayer
+                                useController = false
+                                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
                     )
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .background(Color(0xAA000000))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text("Cliquer = Plein Écran", color = Color.White, fontSize = 9.sp)
+                    }
+                }
+
+                // Détails du programme (Titre, Horaire, Barre de progression, Synopsis)
+                val activeProg = highlightedProgram
+                    ?: previewChannel?.let { epgCache[it.id]?.firstOrNull() }
+
+                Column(
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = activeProg?.title ?: previewChannel?.title ?: "Sélectionnez une chaîne",
+                        color = Color.White,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    if (activeProg != null) {
+                        val remainMin = ((activeProg.stopTimestamp - nowSec) / 60L).coerceAtLeast(0L)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = "${activeProg.startFormatted} – ${activeProg.stopFormatted}",
+                                color = Color(0xFF38BDF8),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            if (remainMin in 1..300) {
+                                Text("• reste ${remainMin} min", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                            }
+                        }
+                        Text(
+                            text = activeProg.description.ifBlank { "Chaîne : ${previewChannel?.title ?: ""} • Appuyez sur OK pour regarder en plein écran." },
+                            color = Color(0xFFCBD5E1),
+                            fontSize = 12.sp,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    } else {
+                        Text(
+                            text = "Catégorie : ${previewChannel?.categoryName ?: ""}",
+                            color = Color(0xFF38BDF8),
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "Appuyez une fois sur une chaîne pour la prévisualiser dans le mini-lecteur, ou recliquez dessus pour l'ouvrir en plein écran.",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            maxLines = 3
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // EN-TÊTE DE LA LIGNE DU TEMPS (Date à gauche + 21:00 | 21:30 | 22:00 | 22:30 | 23:00...)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF151A24))
+                    .padding(vertical = 6.dp, horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = dateHeader,
+                    color = Color(0xFF38BDF8),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.width(210.dp)
+                )
+
+                Row(modifier = Modifier.horizontalScroll(horizontalScrollState)) {
+                    timeSlots.forEach { slotLabel ->
+                        Box(modifier = Modifier.width(160.dp)) {
+                            Text(slotLabel, color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            // LIGNES DES CHAÎNES + CASES HORIZONTALES DES PROGRAMMES EPG
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                itemsIndexed(channels, key = { _, ch -> ch.id }) { index, ch ->
+                    LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
+                    val progs = epgCache[ch.id] ?: emptyList()
+                    val isPlayingInMini = previewChannel?.id == ch.id
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .background(if (isPlayingInMini) Color(0xFF1E293B) else Color(0xFF111622)),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // CASE CHAÎNE À GAUCHE (Numéro + Logo + Nom + Icône Replay)
+                        Row(
+                            modifier = Modifier
+                                .width(210.dp)
+                                .fillMaxHeight()
+                                .tvFocusableClick(
+                                    RoundedCornerShape(6.dp),
+                                    defaultBorderWidth = 0.dp,
+                                    onFocused = {
+                                        previewChannel = ch
+                                        highlightedProgram = progs.firstOrNull()
+                                    },
+                                    onClick = {
+                                        if (previewChannel?.id == ch.id) {
+                                            onPlayChannelFullscreen(ch)
+                                        } else {
+                                            previewChannel = ch
+                                            highlightedProgram = progs.firstOrNull()
+                                        }
+                                    }
+                                )
+                                .padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "${index + 1}",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.width(28.dp)
+                            )
+                            AsyncImage(
+                                model = ch.logoUrl,
+                                contentDescription = ch.title,
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(Color.Black),
+                                contentScale = ContentScale.Fit
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = ch.title,
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (ch.tvArchive == 1) {
+                                Icon(
+                                    Icons.Default.History,
+                                    contentDescription = "Replay",
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                            }
+                        }
+
+                        // CASES HORIZONTALES DES PROGRAMMES SUR PLUSIEURS HEURES
+                        Row(
+                            modifier = Modifier
+                                .horizontalScroll(horizontalScrollState)
+                                .fillMaxHeight(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (progs.isEmpty()) {
+                                repeat(4) {
+                                    Box(
+                                        modifier = Modifier
+                                            .width(220.dp)
+                                            .fillMaxHeight()
+                                            .padding(2.dp)
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(Color(0xFF19202E))
+                                            .clickable {
+                                                if (previewChannel?.id == ch.id) onPlayChannelFullscreen(ch)
+                                                else previewChannel = ch
+                                            }
+                                            .padding(horizontal = 10.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        Text("Pas d'information", color = Color(0xFF64748B), fontSize = 11.sp)
+                                    }
+                                }
+                            } else {
+                                progs.forEach { prog ->
+                                    val durationMin = ((prog.stopTimestamp - prog.startTimestamp) / 60L).coerceIn(15L, 180L)
+                                    // Largeur proportionnelle à la durée de l'émission (30 min = 160.dp)
+                                    val boxWidth = (durationMin * 5.3f).dp.coerceAtLeast(110.dp)
+                                    val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp >= nowSec
+                                    val isPast = prog.stopTimestamp in 1 until nowSec
+                                    val canReplay = isPast && (ch.tvArchive == 1 || prog.hasArchive)
+
+                                    Box(
+                                        modifier = Modifier
+                                            .width(boxWidth)
+                                            .fillMaxHeight()
+                                            .padding(2.dp)
+                                            .tvFocusableClick(
+                                                RoundedCornerShape(5.dp),
+                                                defaultBorderWidth = 1.dp,
+                                                defaultBorderColor = if (isCurrent) Color(0xFF38BDF8) else Color(0xFF262F40),
+                                                onFocused = {
+                                                    previewChannel = ch
+                                                    highlightedProgram = prog
+                                                },
+                                                onClick = {
+                                                    highlightedProgram = prog
+                                                    if (canReplay) {
+                                                        onPlayReplayProgram(ch, prog)
+                                                    } else if (previewChannel?.id == ch.id) {
+                                                        onPlayChannelFullscreen(ch)
+                                                    } else {
+                                                        previewChannel = ch
+                                                    }
+                                                }
+                                            )
+                                            .background(if (isCurrent) Color(0xFF232D42) else Color(0xFF181F2E))
+                                            .padding(horizontal = 8.dp),
+                                        contentAlignment = Alignment.CenterStart
+                                    ) {
+                                        Column {
+                                            Text(
+                                                text = prog.title,
+                                                color = Color.White,
+                                                fontSize = 12.sp,
+                                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                            Text(
+                                                text = if (canReplay) "⏪ ${prog.startFormatted}" else "${prog.startFormatted} - ${prog.stopFormatted}",
+                                                color = if (canReplay) Color(0xFFA855F7) else Color(0xFF94A3B8),
+                                                fontSize = 10.sp
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TiviCategoryRow(name: String, isSelected: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .tvFocusableClick(
+                RoundedCornerShape(6.dp),
+                defaultBorderWidth = 0.dp,
+                onClick = onClick
+            )
+            .background(if (isSelected) Color(0xFFE2E8F0) else Color.Transparent)
+            .padding(horizontal = 10.dp, vertical = 9.dp)
+    ) {
+        Text(
+            text = name,
+            color = if (isSelected) Color(0xFF0F172A) else Color.White,
+            fontSize = 12.sp,
+            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+// =========================================================================
+// 2. FICHE FILM "STYLE NETFLIX" : APERÇU VIDÉO DU FILM EN HAUT À DROITE EN DÉGRADÉ + BANDE-ANNONCE
+// =========================================================================
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun NetflixStyleMovieDetailScreen(
+    movie: MediaEntry,
+    details: VodDetails?,
+    isLoading: Boolean,
+    savedPositionMs: Long,
+    isFavorite: Boolean,
+    onToggleFav: () -> Unit,
+    onPlayFromStart: () -> Unit,
+    onResumePlay: () -> Unit,
+    onWatchTrailer: () -> Unit,
+    onBack: () -> Unit
+) {
+    BackHandler { onBack() }
+    val context = LocalContext.current
+    var isMuted by remember { mutableStateOf(false) }
+
+    // Lecteur d'extrait automatique du film (démarre à 8 minutes dans le film pour éviter le générique noir du début !)
+    val previewPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
+            prepare()
+            seekTo(480_000L) // Extrait à 8 min
+            playWhenReady = true
+            volume = 0.8f
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewPlayer.release() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B0E14))
+    ) {
+        // COIN SUPÉRIEUR DROIT : EXTRAIT VIDÉO DU FILM EN DIRECT AVEC FONDU DÉGRADÉ COMME SUR NETFLIX !
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.65f)
+                .height(340.dp)
+                .align(Alignment.TopEnd)
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        player = previewPlayer
+                        useController = false
+                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Dégradé horizontal de gauche à droite (fond l'extrait vidéo dans le noir à gauche)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            colors = listOf(
+                                Color(0xFF0B0E14),
+                                Color(0xCC0B0E14),
+                                Color(0x440B0E14),
+                                Color.Transparent
+                            )
+                        )
+                    )
+            )
+
+            // Dégradé vertical de haut en bas (fond le bas de la vidéo dans le noir de la page)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            colors = listOf(
+                                Color(0x550B0E14),
+                                Color.Transparent,
+                                Color(0xCC0B0E14),
+                                Color(0xFF0B0E14)
+                            )
+                        )
+                    )
+            )
+        }
+
+        // CONTENU DE LA FICHE FILM PAR-DESSUS LE DÉGRADÉ (À GAUCHE ET EN BAS)
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.clip(CircleShape).background(Color(0x88151A24))
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        // Bouton activer/couper le son de l'extrait Netflix
+                        IconButton(
+                            onClick = {
+                                isMuted = !isMuted
+                                previewPlayer.volume = if (isMuted) 0f else 1f
+                            },
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                        ) {
+                            Icon(
+                                imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                contentDescription = "Son extrait",
+                                tint = Color.White
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onToggleFav,
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                        ) {
+                            Icon(
+                                imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                contentDescription = "Favori",
+                                tint = if (isFavorite) Color(0xFFFACC15) else Color.White
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(0.85f),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    AsyncImage(
+                        model = movie.logoUrl,
+                        contentDescription = movie.title,
+                        modifier = Modifier
+                            .width(115.dp)
+                            .height(170.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, Color(0xFF334155), RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color(0xFFE50914))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        ) {
+                            Text("APERÇU EN DIRECT", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold)
+                        }
+
+                        Text(movie.title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (!details?.rating.isNullOrBlank()) {
+                                Text("⭐ ${details?.rating}/10", color = Color(0xFFFACC15), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                            if (!details?.releaseDate.isNullOrBlank()) {
+                                Text(details?.releaseDate ?: "", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                            }
+                            if (!details?.duration.isNullOrBlank()) {
+                                Text(details?.duration ?: "", color = Color(0xFF38BDF8), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+
+                        Text(
+                            text = details?.genre?.ifBlank { movie.categoryName } ?: movie.categoryName,
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            // BOUTONS D'ACTION : LIRE LE FILM, REPRENDRE, ET BANDE-ANNONCE YOUTUBE !
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            previewPlayer.pause()
+                            onPlayFromStart()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (savedPositionMs > 10000L) "Depuis le début" else "Lecture", color = Color.Black, fontWeight = FontWeight.ExtraBold)
+                    }
+
+                    if (savedPositionMs > 10000L) {
+                        val min = (savedPositionMs / 60000).toInt()
+                        Button(
+                            onClick = {
+                                previewPlayer.pause()
+                                onResumePlay()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reprendre (${min}m)", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    // BOUTON BANDE-ANNONCE (TRAILER)
+                    Button(
+                        onClick = {
+                            previewPlayer.pause()
+                            onWatchTrailer()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // SYNOPSIS & CASTING
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xCC151A24))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Synopsis", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    if (isLoading) {
+                        Text("Chargement du résumé...", color = Color(0xFF94A3B8), fontSize = 13.sp)
+                    } else {
+                        Text(
+                            text = details?.plot?.ifBlank { "Aucun synopsis détaillé renseigné pour ce film." } ?: "",
+                            color = Color(0xFFE2E8F0),
+                            fontSize = 14.sp
+                        )
+                        if (!details?.cast.isNullOrBlank()) {
+                            Text("Distribution : ${details?.cast}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                        if (!details?.director.isNullOrBlank()) {
+                            Text("Réalisation : ${details?.director}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 3. FICHE SÉRIE "STYLE NETFLIX" : EXTRAIT VIDÉO EN DÉGRADÉ EN HAUT À DROITE + BANDE-ANNONCE + SAISONS
+// =========================================================================
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun NetflixStyleSeriesDetailScreen(
+    series: MediaEntry,
+    episodes: List<EpisodeItem>,
+    plot: String,
+    trailerCode: String,
+    isLoading: Boolean,
+    onBack: () -> Unit,
+    onWatchTrailer: () -> Unit,
+    onPlayEpisode: (EpisodeItem) -> Unit
+) {
+    BackHandler { onBack() }
+    val context = LocalContext.current
+    var selectedSeason by remember { mutableStateOf<Int?>(null) }
+    val seasons = remember(episodes) { episodes.map { it.season }.distinct().sorted() }
+
+    LaunchedEffect(seasons) {
+        if (selectedSeason == null && seasons.isNotEmpty()) {
+            selectedSeason = seasons.first()
+        }
+    }
+
+    val previewPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 0.6f
+        }
+    }
+
+    // Dès que les épisodes sont chargés, on joue un extrait du 1er épisode dans le coin supérieur droit en dégradé !
+    LaunchedEffect(episodes.firstOrNull()?.streamUrl) {
+        val firstUrl = episodes.firstOrNull()?.streamUrl
+        if (!firstUrl.isNullOrBlank()) {
+            previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(firstUrl)))
+            previewPlayer.prepare()
+            previewPlayer.seekTo(180_000L) // Extrait à 3 min
+            previewPlayer.playWhenReady = true
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewPlayer.release() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B0E14))
+    ) {
+        // COIN SUPÉRIEUR DROIT : EXTRAIT VIDÉO DE LA SÉRIE EN DÉGRADÉ
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.62f)
+                .height(290.dp)
+                .align(Alignment.TopEnd)
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        player = previewPlayer
+                        useController = false
+                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            listOf(Color(0xFF0B0E14), Color(0xCC0B0E14), Color.Transparent)
+                        )
+                    )
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color(0xCC0B0E14), Color(0xFF0B0E14))
+                        )
+                    )
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(18.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
+                    }
+                    Column {
+                        Text(series.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
+                        if (plot.isNotBlank()) {
+                            Text(plot, color = Color(0xFFCBD5E1), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.fillMaxWidth(0.75f))
+                        }
+                    }
+                }
+
+                // Bouton Bande-annonce Série
+                Button(
+                    onClick = {
+                        previewPlayer.pause()
+                        onWatchTrailer()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            if (seasons.isNotEmpty()) {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(seasons) { s ->
+                        CategoryChip("Saison $s", selectedSeason == s) { selectedSeason = s }
+                    }
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+
+            if (isLoading) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = Color(0xFF38BDF8))
+                }
+            } else {
+                val filteredEps = episodes.filter { selectedSeason == null || it.season == selectedSeason }
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(filteredEps) { ep ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusableClick(RoundedCornerShape(10.dp), onClick = {
+                                    previewPlayer.pause()
+                                    onPlayEpisode(ep)
+                                })
+                                .background(Color(0xDD151A24))
+                                .padding(14.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Saison ${ep.season}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                Text(ep.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                        }
+                    }
                 }
             }
         }
@@ -783,7 +1607,7 @@ fun HomeProDashboard(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(195.dp)
+                    .height(190.dp)
                     .tvFocusableClick(RoundedCornerShape(18.dp), onClick = { if (featured != null) onSelectMedia(featured) })
                     .background(Color(0xFF151A24))
             ) {
@@ -811,13 +1635,13 @@ fun HomeProDashboard(
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
-                                text = "À L'AFFICHE • ${liveChannels.size} CHAÎNES • ${vodMovies.size} FILMS",
+                                text = "NEO TV 5.0 • GRILLE TIVIMATE • APERÇUS NETFLIX • BANDES-ANNONCES",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = featured?.title ?: "NeoTV 4.0 Ultimate",
+                                text = featured?.title ?: "Bienvenue sur NeoTV 5.0",
                                 color = Color.White,
                                 fontSize = 21.sp,
                                 fontWeight = FontWeight.ExtraBold,
@@ -825,19 +1649,30 @@ fun HomeProDashboard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "Replay TV • Contrôle du Direct • Audio/Sous-titres • Ratio Écran",
+                                text = "${liveChannels.size} Chaînes • ${vodMovies.size} Films • ${seriesList.size} Séries",
                                 color = Color(0xFFCBD5E1),
                                 fontSize = 12.sp
                             )
                         }
-                        Button(
-                            onClick = { if (featured != null) onSelectMedia(featured) },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Regarder maintenant", color = Color.Black, fontWeight = FontWeight.Bold)
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { onSelectTab(1) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.LiveTv, contentDescription = null, tint = Color.White)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Ouvrir Grille TiviMate", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { if (featured != null) onSelectMedia(featured) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("À l'affiche", color = Color.Black, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
@@ -887,58 +1722,6 @@ fun HomeProDashboard(
             }
         }
 
-        if (liveChannels.isNotEmpty()) {
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Direct TV & Replay", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Text("Tout voir (${liveChannels.size}) >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(1) })
-                }
-                Spacer(modifier = Modifier.height(10.dp))
-                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(liveChannels.take(25)) { ch ->
-                        LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
-                        val progs = epgNowCache[ch.id]
-                        Column(
-                            modifier = Modifier
-                                .width(205.dp)
-                                .tvFocusableClick(RoundedCornerShape(14.dp), onClick = { onSelectMedia(ch) })
-                                .background(Color(0xFF151A24))
-                                .padding(14.dp)
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                AsyncImage(
-                                    model = ch.logoUrl,
-                                    contentDescription = ch.title,
-                                    modifier = Modifier.size(42.dp).clip(RoundedCornerShape(8.dp)).background(Color(0xFF0B0E14)),
-                                    contentScale = ContentScale.Fit
-                                )
-                                if (ch.tvArchive == 1) {
-                                    Box(
-                                        modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xFF7C3AED)).padding(horizontal = 6.dp, vertical = 2.dp)
-                                    ) {
-                                        Text("⏪ REPLAY", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(ch.title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(
-                                text = progs?.firstOrNull()?.title ?: ch.categoryName,
-                                color = Color(0xFF38BDF8),
-                                fontSize = 12.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
         if (vodMovies.isNotEmpty()) {
             item {
                 Row(
@@ -946,8 +1729,8 @@ fun HomeProDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Films à l'affiche (VOD)", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Text("Tout voir (${vodMovies.size}) >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(2) })
+                    Text("Films à l'affiche (Aperçu vidéo Netflix & Bandes-annonces)", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(2) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -965,8 +1748,8 @@ fun HomeProDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Séries Complètes", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                    Text("Tout voir (${seriesList.size}) >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(3) })
+                    Text("Séries Complètes", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(3) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -979,222 +1762,6 @@ fun HomeProDashboard(
     }
 }
 
-// --- LISTE DES CHAÎNES AVEC MULTI-HORAIRES EPG (En cours + Suivant) + BOUTON GRILLE/REPLAY ---
-@Composable
-fun LiveChannelsList(
-    listState: LazyListState,
-    channels: List<MediaEntry>,
-    favorites: Set<String>,
-    epgNowCache: Map<String, List<EpgProgram>>,
-    onToggleFav: (String) -> Unit,
-    onRequestEpg: (String) -> Unit,
-    onOpenFullEpg: (MediaEntry) -> Unit,
-    onPlayMedia: (MediaEntry) -> Unit
-) {
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize(),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        items(channels, key = { it.id }) { ch ->
-            LaunchedEffect(ch.id) {
-                if (ch.type == "LIVE") onRequestEpg(ch.id)
-            }
-            val progs = epgNowCache[ch.id] ?: emptyList()
-            val nowProg = progs.getOrNull(0)
-            val nextProg = progs.getOrNull(1)
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .tvFocusableClick(RoundedCornerShape(12.dp), onClick = { onPlayMedia(ch) })
-                    .background(Color(0xFF151A24))
-                    .padding(10.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                AsyncImage(
-                    model = ch.logoUrl,
-                    contentDescription = ch.title,
-                    modifier = Modifier
-                        .size(52.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFF0B0E14))
-                        .padding(4.dp),
-                    contentScale = ContentScale.Fit
-                )
-
-                Spacer(modifier = Modifier.width(12.dp))
-
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(ch.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
-                        if (ch.tvArchive == 1) {
-                            Box(
-                                modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFF7C3AED)).padding(horizontal = 5.dp, vertical = 1.dp)
-                            ) {
-                                Text("REPLAY", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
-
-                    if (nowProg != null) {
-                        Text(
-                            text = "▶ ${nowProg.startFormatted}-${nowProg.stopFormatted} : ${nowProg.title}",
-                            color = Color(0xFF38BDF8),
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    } else {
-                        Text(ch.categoryName, color = Color(0xFF94A3B8), fontSize = 12.sp, maxLines = 1)
-                    }
-
-                    if (nextProg != null) {
-                        Text(
-                            text = "Suivant (${nextProg.startFormatted}) : ${nextProg.title}",
-                            color = Color(0xFF94A3B8),
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-
-                // BOUTON GUIDE MULTI-HEURES & REPLAY
-                IconButton(onClick = { onOpenFullEpg(ch) }) {
-                    Icon(Icons.Default.DateRange, contentDescription = "Grille EPG & Replay", tint = Color(0xFF38BDF8))
-                }
-
-                // BOUTON FAVORI
-                IconButton(onClick = { onToggleFav(ch.id) }) {
-                    val isFav = favorites.contains(ch.id)
-                    Icon(
-                        imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                        contentDescription = "Favori",
-                        tint = if (isFav) Color(0xFFFACC15) else Color(0xFF64748B)
-                    )
-                }
-            }
-        }
-    }
-}
-
-// --- ÉCRAN GUIDE EPG SUR PLUSIEURS HEURES + LANCEMENT REPLAY (CATCH-UP) ---
-@Composable
-fun FullEpgAndReplayScreen(
-    channel: MediaEntry,
-    programs: List<EpgProgram>,
-    isLoading: Boolean,
-    onPlayLive: () -> Unit,
-    onPlayReplay: (EpgProgram) -> Unit,
-    onBack: () -> Unit
-) {
-    BackHandler { onBack() }
-    val nowSec = System.currentTimeMillis() / 1000L
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0B0E14))
-            .padding(18.dp)
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
-                }
-                Column {
-                    Text(channel.title, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                    Text(
-                        text = if (channel.tvArchive == 1) "Programmation EPG & Replay disponible (cliquez sur une émission passée)" else "Programmation EPG sur plusieurs heures",
-                        color = Color(0xFF38BDF8),
-                        fontSize = 12.sp
-                    )
-                }
-            }
-
-            Button(
-                onClick = onPlayLive,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
-            ) {
-                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Voir le Direct", color = Color.White, fontWeight = FontWeight.Bold)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(14.dp))
-
-        if (isLoading) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Color(0xFF38BDF8))
-            }
-        } else if (programs.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("Aucun programme détaillé envoyé par le fournisseur pour cette chaîne.", color = Color(0xFF94A3B8))
-            }
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(programs) { prog ->
-                    val isPast = prog.stopTimestamp in 1 until nowSec
-                    val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp >= nowSec
-                    val canReplay = isPast && (channel.tvArchive == 1 || prog.hasArchive)
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .tvFocusableClick(
-                                RoundedCornerShape(12.dp),
-                                onClick = {
-                                    if (isCurrent) onPlayLive()
-                                    else if (canReplay) onPlayReplay(prog)
-                                }
-                            )
-                            .background(if (isCurrent) Color(0xFF1E1B4B) else Color(0xFF151A24))
-                            .padding(14.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(
-                                    text = "${prog.startFormatted} - ${prog.stopFormatted}",
-                                    color = if (isCurrent) Color(0xFF38BDF8) else Color(0xFF94A3B8),
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (isCurrent) {
-                                    Box(modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFFDC2626)).padding(horizontal = 6.dp, vertical = 2.dp)) {
-                                        Text("EN DIRECT", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                } else if (canReplay) {
-                                    Box(modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFF7C3AED)).padding(horizontal = 6.dp, vertical = 2.dp)) {
-                                        Text("⏪ REVOIR EN REPLAY", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                            Text(prog.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                            if (prog.description.isNotBlank()) {
-                                Text(prog.description, color = Color(0xFFCBD5E1), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-
-                        if (isCurrent || canReplay) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = "Lire", tint = Color.White)
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// --- LECTEUR VIDÉO 4.0 : AUTO-HIDE 4s + FORMAT ÉCRAN + AUDIO/SOUS-TITRES + TIMESHIFT DIRECT + EPG MULTI-HEURES ---
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun UltimateVideoPlayerScreen(
@@ -1215,7 +1782,6 @@ fun UltimateVideoPlayerScreen(
 ) {
     val context = LocalContext.current
 
-    // États d'affichage avec masquage automatique au bout de 4 secondes !
     var controlsVisible by remember { mutableStateOf(true) }
     var interactionTick by remember { mutableStateOf(0) }
 
@@ -1223,7 +1789,6 @@ fun UltimateVideoPlayerScreen(
     var showEpgDrawer by remember { mutableStateOf(false) }
     var showTracksDialog by remember { mutableStateOf(false) }
 
-    // Format d'écran (Ratio) : 0 = Normal, 1 = Zoom Plein Écran, 2 = Étiré 16:9
     var resizeModeIndex by remember { mutableStateOf(0) }
     val resizeModes = listOf(
         AspectRatioFrameLayout.RESIZE_MODE_FIT to "Normal",
@@ -1231,7 +1796,6 @@ fun UltimateVideoPlayerScreen(
         AspectRatioFrameLayout.RESIZE_MODE_FILL to "Étiré 16:9"
     )
 
-    // Décalage Timeshift en minutes pour reculer sur le Direct
     var liveTimeshiftMinutes by remember { mutableStateOf(0) }
     var activeUrl by remember(streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
 
@@ -1239,7 +1803,6 @@ fun UltimateVideoPlayerScreen(
         ExoPlayer.Builder(context).build()
     }
 
-    // Masquer automatiquement la barre supérieure après 4 secondes si aucun tiroir n'est ouvert
     LaunchedEffect(controlsVisible, interactionTick, showZappingDrawer, showEpgDrawer, showTracksDialog) {
         if (controlsVisible && !showZappingDrawer && !showEpgDrawer && !showTracksDialog) {
             delay(4000)
@@ -1289,14 +1852,12 @@ fun UltimateVideoPlayerScreen(
         }
     }
 
-    // Fonction pour reculer sur le direct (DVR / Timeshift)
     fun seekLiveOrTimeshift(deltaSeconds: Int) {
         wakeUpControls()
         if (exoPlayer.isCurrentMediaItemSeekable || media.type != "LIVE" || isReplayMode) {
             val target = (exoPlayer.currentPosition + deltaSeconds * 1000L).coerceAtLeast(0L)
             exoPlayer.seekTo(target)
         } else if (media.tvArchive == 1 && serverUrl.isNotBlank()) {
-            // Si le flux live TS n'a pas de mémoire tampon locale, on utilise le serveur Timeshift Xtream !
             val addMin = if (deltaSeconds < 0) -1 else 1
             liveTimeshiftMinutes = (liveTimeshiftMinutes + addMin).coerceAtMost(0)
             if (liveTimeshiftMinutes < 0) {
@@ -1337,7 +1898,6 @@ fun UltimateVideoPlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // BARRE SUPÉRIEURE QUI DISPARAÎT AUTOMATIQUEMENT AU BOUT DE 4 SECONDES !
         if (controlsVisible) {
             Column(
                 modifier = Modifier
@@ -1359,18 +1919,11 @@ fun UltimateVideoPlayerScreen(
                             Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                         }
                         Column {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text(text = media.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                if (isReplayMode || liveTimeshiftMinutes < 0) {
-                                    Box(modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFF7C3AED)).padding(horizontal = 6.dp, vertical = 2.dp)) {
-                                        Text(if (liveTimeshiftMinutes < 0) "TIMESHIFT ${liveTimeshiftMinutes}m" else "REPLAY", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
+                            Text(text = media.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             val currentEpg = epgList.firstOrNull()
                             if (currentEpg != null) {
                                 Text(
-                                    text = "En cours (${currentEpg.startFormatted}-${currentEpg.stopFormatted}) : ${currentEpg.title}",
+                                    text = "${currentEpg.startFormatted}-${currentEpg.stopFormatted} : ${currentEpg.title}",
                                     color = Color(0xFF38BDF8),
                                     fontSize = 12.sp,
                                     maxLines = 1,
@@ -1380,9 +1933,7 @@ fun UltimateVideoPlayerScreen(
                         }
                     }
 
-                    // BOUTONS D'ACTION PRO : FORMAT ÉCRAN, AUDIO/SOUS-TITRES, EPG/REPLAY, ZAPPING
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        // 1. Bouton Format d'écran (Ratio)
                         SmallControlChip(
                             label = "📐 ${resizeModes[resizeModeIndex].second}",
                             onClick = {
@@ -1390,8 +1941,6 @@ fun UltimateVideoPlayerScreen(
                                 resizeModeIndex = (resizeModeIndex + 1) % resizeModes.size
                             }
                         )
-
-                        // 2. Bouton Audio & Sous-titres
                         SmallControlChip(
                             label = "💬 Audio / ST",
                             onClick = {
@@ -1399,8 +1948,6 @@ fun UltimateVideoPlayerScreen(
                                 showTracksDialog = true
                             }
                         )
-
-                        // 3. Bouton EPG Multi-heures & Replay (Sur les chaînes Live)
                         if (media.type == "LIVE") {
                             SmallControlChip(
                                 label = "📅 EPG & Replay",
@@ -1412,8 +1959,6 @@ fun UltimateVideoPlayerScreen(
                                 }
                             )
                         }
-
-                        // 4. Bouton Tiroir Zapping TV
                         if (liveChannelList.isNotEmpty()) {
                             SmallControlChip(
                                 label = if (showZappingDrawer) "Fermer" else "📺 Zapping",
@@ -1428,7 +1973,6 @@ fun UltimateVideoPlayerScreen(
                     }
                 }
 
-                // BARRE DE CONTRÔLE DU DIRECT (Retour en arrière sur le Direct / Timeshift)
                 if (media.type == "LIVE") {
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(
@@ -1455,7 +1999,6 @@ fun UltimateVideoPlayerScreen(
             }
         }
 
-        // TIROIR DE ZAPPING EN SURIMPRESSION (Côté gauche)
         if (showZappingDrawer && liveChannelList.isNotEmpty()) {
             Box(
                 modifier = Modifier
@@ -1486,21 +2029,13 @@ fun UltimateVideoPlayerScreen(
                                 contentScale = ContentScale.Fit
                             )
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text(
-                                text = ch.title,
-                                color = Color.White,
-                                fontSize = 13.sp,
-                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                            Text(ch.title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
             }
         }
 
-        // TIROIR EPG MULTI-HEURES & REPLAY EN SURIMPRESSION (Côté droit)
         if (showEpgDrawer) {
             val nowSec = System.currentTimeMillis() / 1000L
             Box(
@@ -1519,39 +2054,33 @@ fun UltimateVideoPlayerScreen(
                     item {
                         Text("Programmation & Replay", color = Color(0xFF38BDF8), fontSize = 15.sp, fontWeight = FontWeight.Bold)
                     }
-                    if (epgList.isEmpty()) {
-                        item {
-                            Text("Aucun guide détaillé disponible pour cette chaîne.", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                        }
-                    } else {
-                        items(epgList) { prog ->
-                            val isPast = prog.stopTimestamp in 1 until nowSec
-                            val canReplay = isPast && (media.tvArchive == 1 || prog.hasArchive)
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .tvFocusableClick(
-                                        RoundedCornerShape(8.dp),
-                                        onClick = {
-                                            if (canReplay) {
-                                                showEpgDrawer = false
-                                                onPlayReplayProgram(prog)
-                                            }
+                    items(epgList) { prog ->
+                        val isPast = prog.stopTimestamp in 1 until nowSec
+                        val canReplay = isPast && (media.tvArchive == 1 || prog.hasArchive)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusableClick(
+                                    RoundedCornerShape(8.dp),
+                                    onClick = {
+                                        if (canReplay) {
+                                            showEpgDrawer = false
+                                            onPlayReplayProgram(prog)
                                         }
-                                    )
-                                    .background(Color(0xFF151A24))
-                                    .padding(10.dp)
-                            ) {
-                                Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                    Text("${prog.startFormatted} - ${prog.stopFormatted}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                    if (canReplay) {
-                                        Text("⏪ REPLAY", color = Color(0xFFA855F7), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                     }
+                                )
+                                .background(Color(0xFF151A24))
+                                .padding(10.dp)
+                        ) {
+                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                                Text("${prog.startFormatted} - ${prog.stopFormatted}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                if (canReplay) {
+                                    Text("⏪ REPLAY", color = Color(0xFFA855F7), fontSize = 10.sp, fontWeight = FontWeight.Bold)
                                 }
-                                Text(prog.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                                if (prog.description.isNotBlank()) {
-                                    Text(prog.description, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                }
+                            }
+                            Text(prog.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            if (prog.description.isNotBlank()) {
+                                Text(prog.description, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             }
                         }
                     }
@@ -1559,12 +2088,8 @@ fun UltimateVideoPlayerScreen(
             }
         }
 
-        // FENÊTRE DE SÉLECTION DES PISTES AUDIO & SOUS-TITRES
         if (showTracksDialog) {
-            AudioAndSubtitlesDialog(
-                exoPlayer = exoPlayer,
-                onDismiss = { showTracksDialog = false }
-            )
+            AudioAndSubtitlesDialog(exoPlayer = exoPlayer, onDismiss = { showTracksDialog = false })
         }
     }
 }
@@ -1581,7 +2106,6 @@ fun SmallControlChip(label: String, isActive: Boolean = false, onClick: () -> Un
     }
 }
 
-// --- SÉLECTEUR DE LANGUES AUDIO & SOUS-TITRES INTÉGRÉ ---
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun AudioAndSubtitlesDialog(exoPlayer: ExoPlayer, onDismiss: () -> Unit) {
@@ -1614,29 +2138,23 @@ fun AudioAndSubtitlesDialog(exoPlayer: ExoPlayer, onDismiss: () -> Unit) {
         title = { Text("Pistes Audio & Sous-titres", color = Color.White, fontWeight = FontWeight.Bold) },
         text = {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                item {
-                    Text("🔊 Langues Audio (${audioOptions.size})", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                }
-                if (audioOptions.isEmpty()) {
-                    item { Text("Piste audio par défaut uniquement", color = Color(0xFF94A3B8), fontSize = 12.sp) }
-                } else {
-                    items(audioOptions) { opt ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
-                                    val mediaTrackGroup = tracksGroups[opt.groupIndex].mediaTrackGroup
-                                    exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
-                                        .buildUpon()
-                                        .setOverrideForType(TrackSelectionOverride(mediaTrackGroup, opt.trackIndex))
-                                        .build()
-                                    onDismiss()
-                                })
-                                .background(if (opt.isSelected) Color(0xFF8B5CF6) else Color(0xFF0B0E14))
-                                .padding(10.dp)
-                        ) {
-                            Text(opt.label, color = Color.White, fontSize = 13.sp)
-                        }
+                item { Text("🔊 Langues Audio (${audioOptions.size})", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 14.sp) }
+                items(audioOptions) { opt ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                                val mediaTrackGroup = tracksGroups[opt.groupIndex].mediaTrackGroup
+                                exoPlayer.trackSelectionParameters = exoPlayer.trackSelectionParameters
+                                    .buildUpon()
+                                    .setOverrideForType(TrackSelectionOverride(mediaTrackGroup, opt.trackIndex))
+                                    .build()
+                                onDismiss()
+                            })
+                            .background(if (opt.isSelected) Color(0xFF8B5CF6) else Color(0xFF0B0E14))
+                            .padding(10.dp)
+                    ) {
+                        Text(opt.label, color = Color.White, fontSize = 13.sp)
                     }
                 }
 
@@ -1683,155 +2201,9 @@ fun AudioAndSubtitlesDialog(exoPlayer: ExoPlayer, onDismiss: () -> Unit) {
             }
         },
         confirmButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Fermer", color = Color(0xFF38BDF8))
-            }
+            TextButton(onClick = onDismiss) { Text("Fermer", color = Color(0xFF38BDF8)) }
         }
     )
-}
-
-@Composable
-fun MovieDetailScreen(
-    movie: MediaEntry,
-    details: VodDetails?,
-    isLoading: Boolean,
-    savedPositionMs: Long,
-    isFavorite: Boolean,
-    onToggleFav: () -> Unit,
-    onPlayFromStart: () -> Unit,
-    onResumePlay: () -> Unit,
-    onBack: () -> Unit
-) {
-    BackHandler { onBack() }
-
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0B0E14))
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
-                }
-                IconButton(onClick = onToggleFav) {
-                    Icon(
-                        imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                        contentDescription = "Favori",
-                        tint = if (isFavorite) Color(0xFFFACC15) else Color.White
-                    )
-                }
-            }
-        }
-
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                AsyncImage(
-                    model = movie.logoUrl,
-                    contentDescription = movie.title,
-                    modifier = Modifier
-                        .width(130.dp)
-                        .height(195.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF151A24)),
-                    contentScale = ContentScale.Crop
-                )
-
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Text(movie.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
-                    Text(details?.genre?.ifBlank { movie.categoryName } ?: movie.categoryName, color = Color(0xFF38BDF8), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-
-                    if (!details?.rating.isNullOrBlank()) {
-                        Text("⭐ Note : ${details?.rating}/10", color = Color(0xFFFACC15), fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                    }
-                    if (!details?.duration.isNullOrBlank()) {
-                        Text("⏱ Durée : ${details?.duration}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                    if (!details?.releaseDate.isNullOrBlank()) {
-                        Text("📅 Sortie : ${details?.releaseDate}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                }
-            }
-        }
-
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                Button(
-                    onClick = onPlayFromStart,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (savedPositionMs > 10000L) "Depuis le début" else "Regarder le film", color = Color.White, fontWeight = FontWeight.Bold)
-                }
-
-                if (savedPositionMs > 10000L) {
-                    val min = (savedPositionMs / 60000).toInt()
-                    Button(
-                        onClick = onResumePlay,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Reprendre (${min} min)", color = Color.Black, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-        }
-
-        if (isLoading) {
-            item {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(color = Color(0xFF38BDF8), modifier = Modifier.size(20.dp))
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text("Chargement du synopsis et du casting...", color = Color(0xFF94A3B8), fontSize = 13.sp)
-                }
-            }
-        } else if (details != null) {
-            item {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF151A24))
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text("Synopsis / Résumé", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                    Text(
-                        text = details.plot.ifBlank { "Aucun résumé fourni par le serveur Xtream pour ce film." },
-                        color = Color(0xFFCBD5E1),
-                        fontSize = 14.sp
-                    )
-                    if (details.cast.isNotBlank()) {
-                        Text("Acteurs : ${details.cast}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                    if (details.director.isNotBlank()) {
-                        Text("Réalisateur : ${details.director}", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                }
-            }
-        }
-    }
 }
 
 @Composable
@@ -1906,77 +2278,6 @@ fun PosterGrid(
 }
 
 @Composable
-fun SeriesDetailScreen(
-    series: MediaEntry,
-    episodes: List<EpisodeItem>,
-    isLoading: Boolean,
-    onBack: () -> Unit,
-    onPlayEpisode: (EpisodeItem) -> Unit
-) {
-    BackHandler { onBack() }
-    var selectedSeason by remember { mutableStateOf<Int?>(null) }
-    val seasons = remember(episodes) { episodes.map { it.season }.distinct().sorted() }
-
-    LaunchedEffect(seasons) {
-        if (selectedSeason == null && seasons.isNotEmpty()) {
-            selectedSeason = seasons.first()
-        }
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color(0xFF0B0E14))
-            .padding(16.dp)
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
-            }
-            Text(series.title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        }
-
-        Spacer(modifier = Modifier.height(10.dp))
-
-        if (seasons.isNotEmpty()) {
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(seasons) { s ->
-                    CategoryChip("Saison $s", selectedSeason == s) { selectedSeason = s }
-                }
-            }
-            Spacer(modifier = Modifier.height(12.dp))
-        }
-
-        if (isLoading) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator(color = Color(0xFF38BDF8))
-            }
-        } else {
-            val filteredEps = episodes.filter { selectedSeason == null || it.season == selectedSeason }
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(filteredEps) { ep ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .tvFocusableClick(RoundedCornerShape(10.dp), onClick = { onPlayEpisode(ep) })
-                            .background(Color(0xFF151A24))
-                            .padding(14.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Saison ${ep.season}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text(ep.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        }
-                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
     Box(
         modifier = Modifier
@@ -1993,7 +2294,6 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
-// --- ÉCRAN DE CONFIGURATION XTREAM CODES AVEC DATE D'EXPIRATION & STATUT ---
 @Composable
 fun IptvSetupScreen(
     initialServer: String,
@@ -2019,7 +2319,6 @@ fun IptvSetupScreen(
             Text("Paramètres Xtream Codes & Abonnement", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
 
-        // CARTE D'INFORMATIONS D'ABONNEMENT (Expiration, Statut, Connexions)
         item {
             Column(
                 modifier = Modifier
@@ -2081,7 +2380,7 @@ fun IptvSetupScreen(
     }
 }
 
-// --- MOTEUR RÉSEAU XTREAM CODES (ABONNEMENT, REPLAY, EPG MULTI-HEURES, CACHE) ---
+// --- MOTEUR RÉSEAU XTREAM CODES ---
 
 suspend fun fetchAccountInfo(baseUrl: String, user: String, pass: String): AccountInfo = withContext(Dispatchers.IO) {
     try {
@@ -2091,7 +2390,7 @@ suspend fun fetchAccountInfo(baseUrl: String, user: String, pass: String): Accou
         val status = userInfo.optString("status", "Actif")
         val expSec = userInfo.optString("exp_date", "").toLongOrNull()
         val expFormatted = if (expSec != null && expSec > 0) {
-            SimpleDateFormat("dd/MM/yyyy à HH:mm", Locale.FRANCE).format(Date(expSec * 1000L))
+            SimpleDateFormat("dd/MM/yyyy", Locale.FRANCE).format(Date(expSec * 1000L))
         } else {
             "Illimité"
         }
@@ -2175,9 +2474,10 @@ suspend fun fetchXtreamVod(
         val logo = obj.optString("stream_icon", "")
         val catId = obj.optString("category_id")
         val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
+        val trailer = obj.optString("youtube_trailer", "")
         val catName = catMap[catId] ?: "Cinéma"
         val url = "$cleanBase/movie/$user/$pass/$id.$ext"
-        list.add(MediaEntry("vod_$id", name, catId, catName, logo, url, "VOD"))
+        list.add(MediaEntry("vod_$id", name, catId, catName, logo, url, "VOD", trailerId = trailer))
     }
     Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
 }
@@ -2203,8 +2503,9 @@ suspend fun fetchXtreamSeries(
         val name = obj.optString("name", "Série $id")
         val cover = obj.optString("cover", "")
         val catId = obj.optString("category_id")
+        val trailer = obj.optString("youtube_trailer", "")
         val catName = catMap[catId] ?: "Série"
-        list.add(MediaEntry(id, name, catId, catName, cover, "", "SERIES"))
+        list.add(MediaEntry(id, name, catId, catName, cover, "", "SERIES", trailerId = trailer))
     }
     Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
 }
@@ -2221,19 +2522,30 @@ suspend fun fetchVodInfo(baseUrl: String, user: String, pass: String, vodId: Str
             genre = info.optString("genre", ""),
             releaseDate = info.optString("releasedate", ""),
             duration = info.optString("duration", ""),
-            rating = info.optString("rating", "")
+            rating = info.optString("rating", ""),
+            backdropUrl = info.optString("movie_image", ""),
+            youtubeTrailer = info.optString("youtube_trailer", "")
         )
     } catch (e: Exception) {
-        VodDetails("", "", "", "", "", "", "")
+        VodDetails("", "", "", "", "", "", "", "", "")
     }
 }
 
-suspend fun fetchSeriesEpisodes(baseUrl: String, user: String, pass: String, seriesId: String): List<EpisodeItem> = withContext(Dispatchers.IO) {
+suspend fun fetchSeriesEpisodesAndInfo(
+    baseUrl: String,
+    user: String,
+    pass: String,
+    seriesId: String
+): Triple<List<EpisodeItem>, String, String> = withContext(Dispatchers.IO) {
     try {
         val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
         val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_series_info&series_id=$seriesId")
         val root = JSONObject(json)
-        val episodesObj = root.optJSONObject("episodes") ?: return@withContext emptyList()
+        val infoObj = root.optJSONObject("info") ?: JSONObject()
+        val plot = infoObj.optString("plot", "")
+        val trailer = infoObj.optString("youtube_trailer", "")
+
+        val episodesObj = root.optJSONObject("episodes") ?: return@withContext Triple(emptyList(), plot, trailer)
         val result = mutableListOf<EpisodeItem>()
 
         val keys = episodesObj.keys()
@@ -2250,9 +2562,9 @@ suspend fun fetchSeriesEpisodes(baseUrl: String, user: String, pass: String, ser
                 result.add(EpisodeItem(epId, title, seasonNum, url))
             }
         }
-        result
+        Triple(result, plot, trailer)
     } catch (e: Exception) {
-        emptyList()
+        Triple(emptyList(), "", "")
     }
 }
 
@@ -2261,7 +2573,7 @@ suspend fun fetchChannelEpgList(
     user: String,
     pass: String,
     streamId: String,
-    limit: Int = 10
+    limit: Int = 25
 ): List<EpgProgram> = withContext(Dispatchers.IO) {
     try {
         val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
@@ -2323,7 +2635,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTVUltimate/4.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTVV5/5.0 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
