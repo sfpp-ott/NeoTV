@@ -20,11 +20,7 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.StarBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -46,6 +42,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -72,6 +69,7 @@ class MainActivity : ComponentActivity() {
 
 data class MediaEntry(
     val id: String,
+    val rawStreamId: String,
     val title: String,
     val categoryId: String,
     val categoryName: String,
@@ -91,6 +89,27 @@ data class EpisodeItem(
     val title: String,
     val season: Int,
     val streamUrl: String
+)
+
+data class VodDetailedInfo(
+    val plot: String,
+    val cast: String,
+    val director: String,
+    val genre: String,
+    val releaseDate: String,
+    val duration: String,
+    val rating: String,
+    val backdropUrl: String
+)
+
+data class WatchHistoryEntry(
+    val id: String,
+    val title: String,
+    val logoUrl: String,
+    val streamUrl: String,
+    val type: String,
+    val positionMs: Long,
+    val durationMs: Long
 )
 
 @Composable
@@ -116,6 +135,10 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("favs", emptySet())?.toSet() ?: emptySet())
     }
 
+    var watchHistory by remember {
+        mutableStateOf(loadWatchHistory(prefs))
+    }
+
     var epgCache by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     var isLoading by remember { mutableStateOf(false) }
@@ -123,10 +146,18 @@ fun NeoTvApp() {
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
     var showSettings by remember { mutableStateOf(false) }
-    var activeStreamUrl by remember { mutableStateOf<String?>(null) }
-    var activeTitle by remember { mutableStateOf("") }
-    var activeStreamId by remember { mutableStateOf<String?>(null) }
 
+    // État du lecteur vidéo (Supporte le Zapping Direct & la Reprise de lecture)
+    var activeMedia by remember { mutableStateOf<MediaEntry?>(null) }
+    var activeStartPositionMs by remember { mutableStateOf(0L) }
+    var zappingPlaylist by remember { mutableStateOf<List<MediaEntry>>(emptyList()) }
+
+    // État de la fiche Film (Style Netflix / myCANAL)
+    var selectedVod by remember { mutableStateOf<MediaEntry?>(null) }
+    var vodDetails by remember { mutableStateOf<VodDetailedInfo?>(null) }
+    var isVodDetailLoading by remember { mutableStateOf(false) }
+
+    // État de la fiche Série
     var selectedSeries by remember { mutableStateOf<MediaEntry?>(null) }
     var seriesEpisodes by remember { mutableStateOf<List<EpisodeItem>>(emptyList()) }
     var isSeriesLoading by remember { mutableStateOf(false) }
@@ -138,12 +169,21 @@ fun NeoTvApp() {
         prefs.edit().putStringSet("favs", next).apply()
     }
 
-    fun loadEpgForChannel(streamId: String) {
-        if (serverUrl.isBlank() || epgCache.containsKey(streamId)) return
+    fun saveProgress(media: MediaEntry, posMs: Long, durMs: Long) {
+        if (media.type == "LIVE" || durMs <= 0L) return
+        val updated = saveWatchHistoryEntry(
+            prefs,
+            WatchHistoryEntry(media.id, media.title, media.logoUrl, media.streamUrl, media.type, posMs, durMs)
+        )
+        watchHistory = updated
+    }
+
+    fun loadEpgForChannel(rawStreamId: String) {
+        if (serverUrl.isBlank() || epgCache.containsKey(rawStreamId)) return
         scope.launch {
-            val epgTitle = fetchShortEpg(serverUrl, username, password, streamId)
+            val epgTitle = fetchShortEpg(serverUrl, username, password, rawStreamId)
             if (epgTitle.isNotBlank()) {
-                epgCache = epgCache + (streamId to epgTitle)
+                epgCache = epgCache + (rawStreamId to epgTitle)
             }
         }
     }
@@ -182,25 +222,67 @@ fun NeoTvApp() {
     }
 
     when {
-        activeStreamUrl != null -> {
-            val currentEpg = activeStreamId?.let { epgCache[it] } ?: ""
+        activeMedia != null -> {
+            val current = activeMedia!!
+            val currentEpg = if (current.type == "LIVE") epgCache[current.rawStreamId] ?: "" else ""
             VideoPlayerScreen(
-                streamUrl = activeStreamUrl!!,
-                title = activeTitle,
+                currentMedia = current,
                 epgSubtitle = currentEpg,
-                onBack = { activeStreamUrl = null }
+                startPositionMs = activeStartPositionMs,
+                liveZappingList = if (current.type == "LIVE") zappingPlaylist else emptyList(),
+                epgCache = epgCache,
+                onRequestEpg = { loadEpgForChannel(it) },
+                onSwitchChannel = { newChannel ->
+                    // Zapping sécurisé : remplace le flux unique sans créer de double connexion
+                    loadEpgForChannel(newChannel.rawStreamId)
+                    activeStartPositionMs = 0L
+                    activeMedia = newChannel
+                },
+                onSaveProgress = { pos, dur -> saveProgress(current, pos, dur) },
+                onBack = { activeMedia = null }
+            )
+        }
+        selectedVod != null -> {
+            val movie = selectedVod!!
+            val savedEntry = watchHistory.find { it.id == movie.id }
+            VodDetailScreen(
+                movie = movie,
+                details = vodDetails,
+                isLoading = isVodDetailLoading,
+                savedPositionMs = savedEntry?.positionMs ?: 0L,
+                savedDurationMs = savedEntry?.durationMs ?: 0L,
+                isFavorite = favorites.contains(movie.id),
+                onToggleFav = { toggleFavorite(movie.id) },
+                onPlayFromStart = {
+                    activeStartPositionMs = 0L
+                    activeMedia = movie
+                },
+                onResumePlay = { resumePos ->
+                    activeStartPositionMs = resumePos
+                    activeMedia = movie
+                },
+                onBack = { selectedVod = null }
             )
         }
         selectedSeries != null -> {
             SeriesDetailScreen(
                 series = selectedSeries!!,
                 episodes = seriesEpisodes,
+                watchHistory = watchHistory,
                 isLoading = isSeriesLoading,
                 onBack = { selectedSeries = null },
-                onPlayEpisode = { epTitle, url ->
-                    activeTitle = "${selectedSeries!!.title} - $epTitle"
-                    activeStreamId = null
-                    activeStreamUrl = url
+                onPlayEpisode = { ep, resumeMs ->
+                    activeStartPositionMs = resumeMs
+                    activeMedia = MediaEntry(
+                        id = "ep_${ep.id}",
+                        rawStreamId = ep.id,
+                        title = "${selectedSeries!!.title} - S${ep.season} ${ep.title}",
+                        categoryId = "",
+                        categoryName = "Série",
+                        logoUrl = selectedSeries!!.logoUrl,
+                        streamUrl = ep.streamUrl,
+                        type = "VOD"
+                    )
                 }
             )
         }
@@ -233,6 +315,7 @@ fun NeoTvApp() {
                 seriesList = seriesList,
                 seriesCategories = seriesCategories,
                 favorites = favorites,
+                watchHistory = watchHistory,
                 epgCache = epgCache,
                 isLoading = isLoading,
                 statusText = statusText,
@@ -240,19 +323,46 @@ fun NeoTvApp() {
                 onToggleFav = { toggleFavorite(it) },
                 onRequestEpg = { loadEpgForChannel(it) },
                 onOpenSettings = { showSettings = true },
-                onPlayMedia = { entry ->
-                    if (entry.type == "SERIES") {
-                        selectedSeries = entry
-                        isSeriesLoading = true
-                        scope.launch {
-                            seriesEpisodes = fetchSeriesEpisodes(serverUrl, username, password, entry.id)
-                            isSeriesLoading = false
+                onResumeHistoryItem = { hist ->
+                    activeStartPositionMs = hist.positionMs
+                    activeMedia = MediaEntry(
+                        id = hist.id,
+                        rawStreamId = hist.id,
+                        title = hist.title,
+                        categoryId = "",
+                        categoryName = "Reprise",
+                        logoUrl = hist.logoUrl,
+                        streamUrl = hist.streamUrl,
+                        type = hist.type
+                    )
+                },
+                onSelectMedia = { entry, currentListContext ->
+                    when (entry.type) {
+                        "SERIES" -> {
+                            selectedSeries = entry
+                            isSeriesLoading = true
+                            scope.launch {
+                                seriesEpisodes = fetchSeriesEpisodes(serverUrl, username, password, entry.rawStreamId)
+                                isSeriesLoading = false
+                            }
                         }
-                    } else {
-                        if (entry.type == "LIVE") loadEpgForChannel(entry.id)
-                        activeTitle = entry.title
-                        activeStreamId = entry.id
-                        activeStreamUrl = entry.streamUrl
+                        "VOD" -> {
+                            // Ouvre la belle fiche Cinéma façon myCANAL / Netflix
+                            selectedVod = entry
+                            vodDetails = null
+                            isVodDetailLoading = true
+                            scope.launch {
+                                vodDetails = fetchVodInfo(serverUrl, username, password, entry.rawStreamId)
+                                isVodDetailLoading = false
+                            }
+                        }
+                        else -> {
+                            // Chaîne TV en direct : prépare la liste de zapping
+                            loadEpgForChannel(entry.rawStreamId)
+                            zappingPlaylist = currentListContext.ifEmpty { liveChannels }
+                            activeStartPositionMs = 0L
+                            activeMedia = entry
+                        }
                     }
                 }
             )
@@ -269,6 +379,7 @@ fun MainNeoScreen(
     seriesList: List<MediaEntry>,
     seriesCategories: List<CategoryItem>,
     favorites: Set<String>,
+    watchHistory: List<WatchHistoryEntry>,
     epgCache: Map<String, String>,
     isLoading: Boolean,
     statusText: String,
@@ -276,7 +387,8 @@ fun MainNeoScreen(
     onToggleFav: (String) -> Unit,
     onRequestEpg: (String) -> Unit,
     onOpenSettings: () -> Unit,
-    onPlayMedia: (MediaEntry) -> Unit
+    onResumeHistoryItem: (WatchHistoryEntry) -> Unit,
+    onSelectMedia: (MediaEntry, List<MediaEntry>) -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(0) }
     val tabs = listOf("Accueil", "Direct TV", "Films", "Séries", "Favoris")
@@ -284,7 +396,6 @@ fun MainNeoScreen(
     var selectedCatId by remember { mutableStateOf("ALL") }
     var searchQuery by remember { mutableStateOf("") }
 
-    // Réinitialiser le filtre de catégorie quand on change d'onglet
     LaunchedEffect(selectedTab) {
         selectedCatId = "ALL"
         searchQuery = ""
@@ -319,7 +430,6 @@ fun MainNeoScreen(
             .background(Color(0xFF0B0E14))
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
-        // BARRE DU HAUT : LOGO + BOUTON XTREAM
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -349,7 +459,6 @@ fun MainNeoScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // MENU DES 5 ONGLETS (Accueil, Direct TV, Films, Séries, Favoris)
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             itemsIndexed(tabs) { index, tab ->
                 val isSelected = selectedTab == index
@@ -394,7 +503,6 @@ fun MainNeoScreen(
             Text(it, color = Color(0xFFEF4444), fontSize = 12.sp, modifier = Modifier.padding(4.dp))
         }
 
-        // BARRE DE RECHERCHE GLOBALE
         OutlinedTextField(
             value = searchQuery,
             onValueChange = { searchQuery = it },
@@ -407,7 +515,6 @@ fun MainNeoScreen(
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // FILTRE PAR CATÉGORIES (Bouquets TV, Genres de Films ou Séries)
         if (currentCategories.isNotEmpty()) {
             LazyRow(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -422,45 +529,42 @@ fun MainNeoScreen(
             }
         }
 
-        // CONTENU SELON L'ONGLET SÉLECTIONNÉ
         when (selectedTab) {
             0 -> {
-                // ONGLET ACCUEIL : Vue combinée style myCANAL (Direct + Films + Séries)
                 HomeDashboard(
                     liveChannels = liveChannels.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     vodMovies = vodMovies.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
                     seriesList = seriesList.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
+                    watchHistory = watchHistory,
                     epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
-                    onPlayMedia = onPlayMedia,
+                    onResumeHistoryItem = onResumeHistoryItem,
+                    onSelectMedia = { item -> onSelectMedia(item, liveChannels) },
                     onSelectTab = { selectedTab = it }
                 )
             }
             1 -> {
-                // ONGLET DIRECT TV AVEC LOGOS + EPG EN TEMPS RÉEL + FAVORIS
                 LiveChannelsList(
                     channels = currentList,
                     favorites = favorites,
                     epgCache = epgCache,
                     onToggleFav = onToggleFav,
                     onRequestEpg = onRequestEpg,
-                    onPlayMedia = onPlayMedia
+                    onPlayMedia = { item -> onSelectMedia(item, currentList) }
                 )
             }
             2, 3 -> {
-                // ONGLETS FILMS & SÉRIES : GRILLE D'AFFICHES CINÉMA (3 colonnes)
                 PosterGrid(
                     items = currentList,
                     favorites = favorites,
                     onToggleFav = onToggleFav,
-                    onPlayMedia = onPlayMedia
+                    onPlayMedia = { item -> onSelectMedia(item, currentList) }
                 )
             }
             4 -> {
-                // ONGLET FAVORIS
                 if (currentList.isEmpty()) {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        Text("Aucun favori pour le moment. Appuyez sur ⭐ à côté d'une chaîne ou d'un film !", color = Color(0xFF94A3B8))
+                        Text("Aucun favori. Appuyez sur ⭐ sur une chaîne ou un film !", color = Color(0xFF94A3B8))
                     }
                 } else {
                     LiveChannelsList(
@@ -469,7 +573,7 @@ fun MainNeoScreen(
                         epgCache = epgCache,
                         onToggleFav = onToggleFav,
                         onRequestEpg = onRequestEpg,
-                        onPlayMedia = onPlayMedia
+                        onPlayMedia = { item -> onSelectMedia(item, currentList) }
                     )
                 }
             }
@@ -482,9 +586,11 @@ fun HomeDashboard(
     liveChannels: List<MediaEntry>,
     vodMovies: List<MediaEntry>,
     seriesList: List<MediaEntry>,
+    watchHistory: List<WatchHistoryEntry>,
     epgCache: Map<String, String>,
     onRequestEpg: (String) -> Unit,
-    onPlayMedia: (MediaEntry) -> Unit,
+    onResumeHistoryItem: (WatchHistoryEntry) -> Unit,
+    onSelectMedia: (MediaEntry) -> Unit,
     onSelectTab: (Int) -> Unit
 ) {
     LazyColumn(
@@ -514,7 +620,7 @@ fun HomeDashboard(
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = featured?.title ?: "Bienvenue sur NeoTV",
+                        text = featured?.title ?: "Bienvenue sur NeoTV Pro",
                         color = Color.White,
                         fontSize = 21.sp,
                         fontWeight = FontWeight.ExtraBold,
@@ -522,18 +628,65 @@ fun HomeDashboard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "Logos HD, EPG en direct, Films & Séries activés",
+                        text = "Zapping en plein écran, Fiches Cinéma & Reprise de lecture activés",
                         color = Color(0xFFCBD5E1),
                         fontSize = 13.sp
                     )
                     Button(
-                        onClick = { if (featured != null) onPlayMedia(featured) },
+                        onClick = { if (featured != null) onSelectMedia(featured) },
                         colors = ButtonDefaults.buttonColors(containerColor = Color.White),
                         shape = RoundedCornerShape(10.dp)
                     ) {
                         Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Lancer maintenant", color = Color.Black, fontWeight = FontWeight.Bold)
+                        Text("Découvrir", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        // NOUVEAU : SECTION "REPRENDRE LA LECTURE" (Style Netflix / myCANAL)
+        if (watchHistory.isNotEmpty()) {
+            item {
+                Text("Reprendre la lecture", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(10.dp))
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(watchHistory) { hist ->
+                        val progress = (hist.positionMs.toFloat() / hist.durationMs.coerceAtLeast(1L)).coerceIn(0.05f, 0.98f)
+                        val remainingMin = ((hist.durationMs - hist.positionMs) / 60000L).coerceAtLeast(1L)
+                        Column(
+                            modifier = Modifier
+                                .width(200.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF151A24))
+                                .border(1.dp, Color(0xFF8B5CF6), RoundedCornerShape(14.dp))
+                                .clickable { onResumeHistoryItem(hist) }
+                                .padding(12.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                AsyncImage(
+                                    model = hist.logoUrl,
+                                    contentDescription = hist.title,
+                                    modifier = Modifier
+                                        .size(48.dp)
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(Color(0xFF0B0E14)),
+                                    contentScale = ContentScale.Crop
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(hist.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("Reste $remainingMin min", color = Color(0xFF38BDF8), fontSize = 11.sp)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            LinearProgressIndicator(
+                                progress = progress,
+                                modifier = Modifier.fillMaxWidth().height(5.dp).clip(CircleShape),
+                                color = Color(0xFFA855F7),
+                                trackColor = Color(0xFF334155)
+                            )
+                        }
                     }
                 }
             }
@@ -553,14 +706,14 @@ fun HomeDashboard(
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(liveChannels.take(20)) { ch ->
-                        LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
+                        LaunchedEffect(ch.rawStreamId) { onRequestEpg(ch.rawStreamId) }
                         Column(
                             modifier = Modifier
                                 .width(170.dp)
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF151A24))
                                 .border(1.dp, Color(0xFF262F40), RoundedCornerShape(14.dp))
-                                .clickable { onPlayMedia(ch) }
+                                .clickable { onSelectMedia(ch) }
                                 .padding(12.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
@@ -576,7 +729,7 @@ fun HomeDashboard(
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(ch.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             Text(
-                                text = epgCache[ch.id] ?: ch.categoryName,
+                                text = epgCache[ch.rawStreamId] ?: ch.categoryName,
                                 color = Color(0xFF38BDF8),
                                 fontSize = 11.sp,
                                 maxLines = 1,
@@ -588,7 +741,7 @@ fun HomeDashboard(
             }
         }
 
-        // CARROUSEL FILMS (VOD) AVEC AFFICHES
+        // CARROUSEL FILMS (VOD)
         if (vodMovies.isNotEmpty()) {
             item {
                 Row(
@@ -602,13 +755,13 @@ fun HomeDashboard(
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(vodMovies.take(20)) { movie ->
-                        PosterCard(movie, onClick = { onPlayMedia(movie) })
+                        PosterCard(movie, onClick = { onSelectMedia(movie) })
                     }
                 }
             }
         }
 
-        // CARROUSEL SÉRIES AVEC AFFICHES
+        // CARROUSEL SÉRIES
         if (seriesList.isNotEmpty()) {
             item {
                 Row(
@@ -622,7 +775,173 @@ fun HomeDashboard(
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(seriesList.take(20)) { serie ->
-                        PosterCard(serie, onClick = { onPlayMedia(serie) })
+                        PosterCard(serie, onClick = { onSelectMedia(serie) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- NOUVEL ÉCRAN : FICHE CINÉMA STYLE NETFLIX / MYCANAL ---
+@Composable
+fun VodDetailScreen(
+    movie: MediaEntry,
+    details: VodDetailedInfo?,
+    isLoading: Boolean,
+    savedPositionMs: Long,
+    savedDurationMs: Long,
+    isFavorite: Boolean,
+    onToggleFav: () -> Unit,
+    onPlayFromStart: () -> Unit,
+    onResumePlay: (Long) -> Unit,
+    onBack: () -> Unit
+) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B0E14))
+            .padding(18.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+    ) {
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
+                    }
+                    Text("Fiche Film", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+                IconButton(onClick = onToggleFav) {
+                    Icon(
+                        imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                        contentDescription = "Favori",
+                        tint = if (isFavorite) Color(0xFFFACC15) else Color.White
+                    )
+                }
+            }
+        }
+
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                AsyncImage(
+                    model = movie.logoUrl,
+                    contentDescription = movie.title,
+                    modifier = Modifier
+                        .width(135.dp)
+                        .height(200.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF151A24)),
+                    contentScale = ContentScale.Crop
+                )
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(movie.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(movie.categoryName, color = Color(0xFF38BDF8), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+
+                    if (details != null) {
+                        if (details.rating.isNotBlank()) {
+                            Text("⭐ Note : ${details.rating}/10", color = Color(0xFFFACC15), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        if (details.releaseDate.isNotBlank()) {
+                            Text("Sortie : ${details.releaseDate}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                        if (details.duration.isNotBlank()) {
+                            Text("Durée : ${details.duration}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                        if (details.genre.isNotBlank()) {
+                            Text(details.genre, color = Color(0xFFCBD5E1), fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // BOUTONS DE LECTURE & REPRISE AUTOMATIQUE
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (savedPositionMs > 30000L) {
+                    val min = savedPositionMs / 60000L
+                    Button(
+                        onClick = { onResumePlay(savedPositionMs) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth().height(50.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Reprendre à $min min", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    }
+                }
+
+                Button(
+                    onClick = onPlayFromStart,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (savedPositionMs > 30000L) Color(0xFF1E293B) else Color.White
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    Icon(
+                        Icons.Default.PlayArrow,
+                        contentDescription = null,
+                        tint = if (savedPositionMs > 30000L) Color.White else Color.Black
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = if (savedPositionMs > 30000L) "Recommencer depuis le début" else "Regarder le Film",
+                        color = if (savedPositionMs > 30000L) Color.White else Color.Black,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                }
+            }
+        }
+
+        if (isLoading) {
+            item {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(color = Color(0xFF38BDF8), modifier = Modifier.size(20.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text("Récupération du synopsis et du casting...", color = Color(0xFF94A3B8), fontSize = 13.sp)
+                }
+            }
+        }
+
+        details?.let { info ->
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF151A24))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text("Synopsis", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = info.plot.ifBlank { "Aucun résumé disponible pour ce film." },
+                        color = Color(0xFFCBD5E1),
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    )
+
+                    if (info.director.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text("Réalisateur : ${info.director}", color = Color(0xFF38BDF8), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (info.cast.isNotBlank()) {
+                        Text("Acteurs : ${info.cast}", color = Color(0xFF94A3B8), fontSize = 13.sp)
                     }
                 }
             }
@@ -669,11 +988,10 @@ fun LiveChannelsList(
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         items(channels.take(300)) { ch ->
-            // Charge automatiquement l'EPG des chaînes visibles à l'écran
-            LaunchedEffect(ch.id) {
-                if (ch.type == "LIVE") onRequestEpg(ch.id)
+            LaunchedEffect(ch.rawStreamId) {
+                if (ch.type == "LIVE") onRequestEpg(ch.rawStreamId)
             }
-            val epgNow = epgCache[ch.id]
+            val epgNow = epgCache[ch.rawStreamId]
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -683,7 +1001,6 @@ fun LiveChannelsList(
                     .padding(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // LOGO DE LA CHAÎNE
                 AsyncImage(
                     model = ch.logoUrl,
                     contentDescription = ch.title,
@@ -697,7 +1014,6 @@ fun LiveChannelsList(
 
                 Spacer(modifier = Modifier.width(12.dp))
 
-                // NOM DE LA CHAÎNE + PROGRAMME TV (EPG) EN DIRECT
                 Column(modifier = Modifier.weight(1f)) {
                     Text(ch.title, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (!epgNow.isNullOrBlank()) {
@@ -707,7 +1023,6 @@ fun LiveChannelsList(
                     }
                 }
 
-                // BOUTON FAVORI ÉTOILE
                 IconButton(onClick = { onToggleFav(ch.id) }) {
                     val isFav = favorites.contains(ch.id)
                     Icon(
@@ -777,9 +1092,10 @@ fun PosterGrid(
 fun SeriesDetailScreen(
     series: MediaEntry,
     episodes: List<EpisodeItem>,
+    watchHistory: List<WatchHistoryEntry>,
     isLoading: Boolean,
     onBack: () -> Unit,
-    onPlayEpisode: (String, String) -> Unit
+    onPlayEpisode: (EpisodeItem, Long) -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -805,12 +1121,14 @@ fun SeriesDetailScreen(
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(episodes) { ep ->
+                    val savedEp = watchHistory.find { it.id == "ep_${ep.id}" }
+                    val resumeMs = savedEp?.positionMs ?: 0L
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(10.dp))
                             .background(Color(0xFF151A24))
-                            .clickable { onPlayEpisode(ep.title, ep.streamUrl) }
+                            .clickable { onPlayEpisode(ep, resumeMs) }
                             .padding(14.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -818,6 +1136,9 @@ fun SeriesDetailScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Saison ${ep.season}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                             Text(ep.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            if (resumeMs > 30000L) {
+                                Text("Reprendre à ${resumeMs / 60000L} min", color = Color(0xFFA855F7), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
                         }
                         Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
                     }
@@ -866,7 +1187,7 @@ fun IptvSetupScreen(
     ) {
         item {
             Text("Configuration Xtream Codes", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
-            Text("Active automatiquement : Direct TV + Logos + EPG + Films + Séries", color = Color(0xFF38BDF8), fontSize = 13.sp)
+            Text("Protection anti-bannissement activée : 1 seule connexion simultanée garantie.", color = Color(0xFF38BDF8), fontSize = 13.sp)
         }
 
         item {
@@ -906,221 +1227,4 @@ fun IptvSetupScreen(
                     Text("Synchroniser Tout", color = Color.White, fontWeight = FontWeight.Bold)
                 }
                 OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
-                    Text("Annuler", color = Color.White)
-                }
-            }
-        }
-    }
-}
-
-// --- FONCTIONS RÉSEAU XTREAM CODES (LIVE, VOD, SÉRIES, EPG) ---
-
-suspend fun fetchXtreamLive(
-    baseUrl: String,
-    user: String,
-    pass: String
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catMap = fetchCategoryMap("$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_categories")
-
-    val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_streams")
-    val arr = JSONArray(json)
-    val list = mutableListOf<MediaEntry>()
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("stream_id")
-        val name = obj.optString("name", "Chaîne $id")
-        val logo = obj.optString("stream_icon", "")
-        val catId = obj.optString("category_id")
-        val catName = catMap[catId] ?: "Direct TV"
-        val url = "$cleanBase/live/$user/$pass/$id.ts"
-        list.add(MediaEntry(id, name, catId, catName, logo, url, "LIVE"))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
-}
-
-suspend fun fetchXtreamVod(
-    baseUrl: String,
-    user: String,
-    pass: String
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catMap = fetchCategoryMap("$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_categories")
-
-    val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_streams")
-    val arr = JSONArray(json)
-    val list = mutableListOf<MediaEntry>()
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("stream_id")
-        val name = obj.optString("name", "Film $id")
-        val logo = obj.optString("stream_icon", "")
-        val catId = obj.optString("category_id")
-        val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
-        val catName = catMap[catId] ?: "Cinéma"
-        val url = "$cleanBase/movie/$user/$pass/$id.$ext"
-        list.add(MediaEntry("vod_$id", name, catId, catName, logo, url, "VOD"))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
-}
-
-suspend fun fetchXtreamSeries(
-    baseUrl: String,
-    user: String,
-    pass: String
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catMap = fetchCategoryMap("$cleanBase/player_api.php?username=$user&password=$pass&action=get_series_categories")
-
-    val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_series")
-    val arr = JSONArray(json)
-    val list = mutableListOf<MediaEntry>()
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("series_id")
-        val name = obj.optString("name", "Série $id")
-        val cover = obj.optString("cover", "")
-        val catId = obj.optString("category_id")
-        val catName = catMap[catId] ?: "Série"
-        list.add(MediaEntry(id, name, catId, catName, cover, "", "SERIES"))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
-}
-
-suspend fun fetchSeriesEpisodes(
-    baseUrl: String,
-    user: String,
-    pass: String,
-    seriesId: String
-): List<EpisodeItem> = withContext(Dispatchers.IO) {
-    try {
-        val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-        val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_series_info&series_id=$seriesId")
-        val root = JSONObject(json)
-        val episodesObj = root.optJSONObject("episodes") ?: return@withContext emptyList()
-        val result = mutableListOf<EpisodeItem>()
-
-        val keys = episodesObj.keys()
-        while (keys.hasNext()) {
-            val seasonKey = keys.next()
-            val epArray = episodesObj.optJSONArray(seasonKey) ?: continue
-            for (i in 0 until epArray.length()) {
-                val ep = epArray.getJSONObject(i)
-                val epId = ep.optString("id")
-                val title = ep.optString("title", "Épisode ${i + 1}")
-                val ext = ep.optString("container_extension", "mp4").ifBlank { "mp4" }
-                val seasonNum = ep.optInt("season", seasonKey.toIntOrNull() ?: 1)
-                val url = "$cleanBase/series/$user/$pass/$epId.$ext"
-                result.add(EpisodeItem(epId, title, seasonNum, url))
-            }
-        }
-        result
-    } catch (e: Exception) {
-        emptyList()
-    }
-}
-
-suspend fun fetchShortEpg(
-    baseUrl: String,
-    user: String,
-    pass: String,
-    streamId: String
-): String = withContext(Dispatchers.IO) {
-    try {
-        val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-        val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_short_epg&stream_id=$streamId&limit=1")
-        val obj = JSONObject(json)
-        val arr = obj.optJSONArray("epg_listings")
-        if (arr != null && arr.length() > 0) {
-            val rawTitle = arr.getJSONObject(0).optString("title", "")
-            decodeBase64IfPossible(rawTitle)
-        } else ""
-    } catch (e: Exception) {
-        ""
-    }
-}
-
-fun decodeBase64IfPossible(input: String): String {
-    if (input.isBlank()) return ""
-    return try {
-        val decoded = String(Base64.decode(input, Base64.DEFAULT), Charsets.UTF_8)
-        if (decoded.any { it.isLetterOrDigit() }) decoded else input
-    } catch (e: Exception) {
-        input
-    }
-}
-
-fun fetchCategoryMap(url: String): LinkedHashMap<String, String> {
-    val map = LinkedHashMap<String, String>()
-    return try {
-        val arr = JSONArray(httpGet(url))
-        for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            map[obj.optString("category_id")] = obj.optString("category_name", "Général")
-        }
-        map
-    } catch (e: Exception) {
-        map
-    }
-}
-
-fun httpGet(urlStr: String): String {
-    val url = URL(urlStr)
-    val conn = (url.openConnection() as HttpURLConnection).apply {
-        requestMethod = "GET"
-        connectTimeout = 15000
-        readTimeout = 30000
-        setRequestProperty("User-Agent", "NeoTV/2.0 (ExoPlayer)")
-    }
-    return conn.inputStream.bufferedReader().use { it.readText() }
-}
-
-@Composable
-fun VideoPlayerScreen(streamUrl: String, title: String, epgSubtitle: String, onBack: () -> Unit) {
-    val context = LocalContext.current
-    val exoPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(Uri.parse(streamUrl)))
-            prepare()
-            playWhenReady = true
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose { exoPlayer.release() }
-    }
-
-    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = true
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0x99000000))
-                .padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            IconButton(onClick = onBack) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
-            }
-            Spacer(modifier = Modifier.width(8.dp))
-            Column {
-                Text(text = title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
-                if (epgSubtitle.isNotBlank()) {
-                    Text(text = "En cours : $epgSubtitle", color = Color(0xFF38BDF8), fontSize = 12.sp)
-                }
-            }
-        }
-    }
-}
+                    Text("Annuler", color = Color
