@@ -261,7 +261,9 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
-    var epgCache by remember { mutableStateOf>>(emptyMap()) }
+    var epgCache by remember { mutableStateOf(emptyMap<String, List<EpgProgram>>()) }
+
+
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
