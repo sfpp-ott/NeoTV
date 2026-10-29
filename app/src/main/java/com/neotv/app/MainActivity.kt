@@ -66,7 +66,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
@@ -129,7 +128,6 @@ fun Modifier.tvFocusableClick(
         .clickable { onClick() }
 }
 
-// Détection automatique des contenus et catégories Adultes (18+)
 fun isAdultText(text: String): Boolean {
     val lower = text.lowercase(Locale.ROOT)
     val adultKeywords = listOf(
@@ -231,7 +229,6 @@ fun NeoTvApp() {
     var username by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var password by remember { mutableStateOf(prefs.getString("pass", "") ?: "") }
 
-    // CONTRÔLE PARENTAL (Code par défaut : 0000)
     var parentalPin by remember { mutableStateOf(prefs.getString("parental_pin", "0000") ?: "0000") }
     var parentalEnabled by remember { mutableStateOf(prefs.getBoolean("parental_enabled", true)) }
     var pendingPinAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -358,7 +355,6 @@ fun NeoTvApp() {
         loadAllXtreamData(forceRefresh = false)
     }
 
-    // FENÊTRE DE VÉRIFICATION DU CODE PARENTAL (18+)
     if (pendingPinAction != null) {
         ParentalPinPromptDialog(
             expectedPin = parentalPin,
@@ -636,7 +632,6 @@ fun MainScreen(
         else -> emptyList()
     }
 
-    // Dans "Tout (ALL)", si le contrôle parental est actif, on masque automatiquement les contenus adultes (ils n'apparaissent que si on déverrouille leur catégorie 18+)
     val currentList = remember(selectedTab, liveChannels, vodMovies, seriesList, favorites, selectedCatId, searchQuery, parentalEnabled) {
         val base = when (selectedTab) {
             1 -> if (selectedCatId == "FAV") liveChannels.filter { favorites.contains(it.id) } else liveChannels
@@ -656,7 +651,6 @@ fun MainScreen(
         }
     }
 
-    // FENÊTRE DE RECHERCHE QUI S'OUVRE UNIQUEMENT AU CLIC SUR LA BARRE DE RECHERCHE !
     if (showSearchDialog) {
         SearchModalDialog(
             initialQuery = searchQuery,
@@ -674,7 +668,6 @@ fun MainScreen(
             .background(Color(0xFF0B0E14))
             .padding(horizontal = 14.dp, vertical = 8.dp)
     ) {
-        // BARRE SUPÉRIEURE
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -750,8 +743,6 @@ fun MainScreen(
             Text(it, color = Color(0xFFEF4444), fontSize = 12.sp)
         }
 
-        // NOUVELLE BARRE DE RECHERCHE ANTI-CLAVIER INTEMPESTIF :
-        // Descendre avec la télécommande ne déclenche PAS le clavier virtuel ! Il faut cliquer sur OK pour l'ouvrir.
         if (selectedTab != 1) {
             Row(
                 modifier = Modifier
@@ -848,7 +839,6 @@ fun MainScreen(
     }
 }
 
-// --- FENÊTRE DE SAISIE DE RECHERCHE (S'ouvre uniquement quand on clique sur la barre de recherche) ---
 @Composable
 fun SearchModalDialog(
     initialQuery: String,
@@ -895,7 +885,6 @@ fun SearchModalDialog(
     )
 }
 
-// --- FENÊTRE DU CODE PARENTAL (18+) ---
 @Composable
 fun ParentalPinPromptDialog(
     expectedPin: String,
@@ -955,9 +944,6 @@ fun ParentalPinPromptDialog(
     )
 }
 
-// =========================================================================
-// 1. GUIDE TV HORIZONTAL CALIBRÉ + PROTECTION ADULTE
-// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
@@ -1014,7 +1000,6 @@ fun TvGuideScreen(
     val horizontalScrollState = rememberScrollState()
 
     Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
-        // COLONNE GAUCHE : CATÉGORIES AVEC CADENAS SUR LES CATÉGORIES ADULTES
         LazyColumn(
             modifier = Modifier
                 .width(165.dp)
@@ -1339,7 +1324,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM AVEC DÉGRADÉ BAS 100 % OPAQUE (ZÉRO BANDE CLAIRE EN BAS !)
+// 2. FICHE FILM : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1378,56 +1363,51 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // L'APERÇU VIDÉO S'ARRÊTE À 70% DE LA HAUTEUR ET FOND À 100% DANS LE NOIR EN BAS !
+        // 1. LA VIDÉO D'APERÇU
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN (Noir à gauche -> Transparent à droite)
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.70f)
-                .align(Alignment.TopEnd)
-        ) {
-            AndroidView(
-                factory = { ctx ->
-                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                        player = previewPlayer
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-
-            // Dégradé horizontal de gauche à droite
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.horizontalGradient(
-                            0.00f to Color(0xFF0B0E14),
-                            0.25f to Color(0xFF0B0E14),
-                            0.42f to Color(0xE60B0E14),
-                            0.58f to Color(0x990B0E14),
-                            0.75f to Color(0x330B0E14),
-                            1.00f to Color.Transparent
-                        )
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.24f to Color(0xFF0B0E14),
+                        0.42f to Color(0xE60B0E14),
+                        0.58f to Color(0x990B0E14),
+                        0.75f to Color(0x330B0E14),
+                        1.00f to Color.Transparent
                     )
-            )
+                )
+        )
 
-            // Dégradé vertical renforcé en bas : devient 100% opaque dès 80% de la boîte vidéo !
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            0.00f to Color(0x990B0E14),
-                            0.20f to Color.Transparent,
-                            0.50f to Color(0x770B0E14),
-                            0.72f to Color(0xDD0B0E14),
-                            0.84f to Color(0xFF0B0E14),
-                            1.00f to Color(0xFF0B0E14)
-                        )
+        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Transparent en haut -> Noir 100% massif sur tout le bas de l'écran)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x880B0E14),
+                        0.18f to Color.Transparent,
+                        0.40f to Color(0x660B0E14),
+                        0.54f to Color(0xCC0B0E14),
+                        0.66f to Color(0xF50B0E14),
+                        0.74f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
                     )
-            )
-        }
+                )
+        )
 
+        // 4. CONTENU DE LA FICHE FILM PAR-DESSUS LE FOND DÉGRADÉ
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1598,7 +1578,7 @@ fun MovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE AVEC DÉGRADÉ BAS 100 % OPAQUE (ZÉRO BANDE CLAIRE EN BAS !)
+// 3. FICHE SÉRIE : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1647,51 +1627,49 @@ fun SeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // L'APERÇU VIDÉO S'ARRÊTE À 65% DE LA HAUTEUR ET FOND TOTALEMENT DANS LE NOIR AVANT LE BAS !
+        // 1. VIDÉO D'APERÇU DE LA SÉRIE
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.65f)
-                .align(Alignment.TopEnd)
-        ) {
-            AndroidView(
-                factory = { ctx ->
-                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                        player = previewPlayer
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.horizontalGradient(
-                            0.00f to Color(0xFF0B0E14),
-                            0.25f to Color(0xFF0B0E14),
-                            0.45f to Color(0xCC0B0E14),
-                            0.70f to Color(0x550B0E14),
-                            1.00f to Color.Transparent
-                        )
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.28f to Color(0xFF0B0E14),
+                        0.48f to Color(0xCC0B0E14),
+                        0.72f to Color(0x550B0E14),
+                        1.00f to Color.Transparent
                     )
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            0.00f to Color(0x880B0E14),
-                            0.25f to Color.Transparent,
-                            0.55f to Color(0x990B0E14),
-                            0.78f to Color(0xEE0B0E14),
-                            0.88f to Color(0xFF0B0E14),
-                            1.00f to Color(0xFF0B0E14)
-                        )
-                    )
-            )
-        }
+                )
+        )
 
+        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Fond totalement dans le noir #0B0E14 avant le bas)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x880B0E14),
+                        0.18f to Color.Transparent,
+                        0.38f to Color(0x880B0E14),
+                        0.52f to Color(0xE60B0E14),
+                        0.64f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
+                    )
+                )
+        )
+
+        // 4. CONTENU DE LA SÉRIE
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -2479,9 +2457,6 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
-// =========================================================================
-// 4. ÉCRAN PARAMÈTRES AVEC CONTRÔLE PARENTAL & CHANGEMENT DE MOT DE PASSE PIN
-// =========================================================================
 @Composable
 fun IptvSetupScreen(
     initialServer: String,
@@ -2525,7 +2500,6 @@ fun IptvSetupScreen(
             Text("Paramètres, Abonnement & Contrôle Parental", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
 
-        // BLOC 1 : INFORMATIONS D'ABONNEMENT
         item {
             Column(
                 modifier = Modifier
@@ -2543,7 +2517,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC 2 : CONTRÔLE PARENTAL (18+) & CHANGEMENT DE MOT DE PASSE
         item {
             Column(
                 modifier = Modifier
@@ -2587,7 +2560,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC 3 : IDENTIFIANTS XTREAM CODES
         item {
             OutlinedTextField(
                 value = server,
@@ -2691,17 +2663,13 @@ fun ChangeParentalPinDialog(
     )
 }
 
-// =========================================================================
-// 5. MOTEUR RÉSEAU EN STREAMING (JSONREADER) ANTI-CRASH MÉMOIRE FIRE STICK 4K
-// =========================================================================
-
 fun downloadUrlToFile(urlStr: String, destFile: File) {
     val url = URL(urlStr)
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/6.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3089,7 +3057,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/6.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
