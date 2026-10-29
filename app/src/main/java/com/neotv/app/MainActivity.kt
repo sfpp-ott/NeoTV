@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.util.Base64
+import android.util.JsonReader
+import android.util.JsonToken
 import android.view.LayoutInflater
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -17,7 +19,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyGridState
@@ -67,7 +68,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
@@ -125,6 +129,16 @@ fun Modifier.tvFocusableClick(
         .clickable { onClick() }
 }
 
+// Détection automatique des contenus et catégories Adultes (18+)
+fun isAdultText(text: String): Boolean {
+    val lower = text.lowercase(Locale.ROOT)
+    val adultKeywords = listOf(
+        "adult", "xxx", "18+", "+18", "x-rated", "erot", "porn",
+        "for adults", "sexe", "hentai", "dorcel", "hustler", "brazzers", "penthouse", "private"
+    )
+    return adultKeywords.any { lower.contains(it) }
+}
+
 data class MediaEntry(
     val id: String,
     val title: String,
@@ -135,12 +149,14 @@ data class MediaEntry(
     val type: String, // "LIVE", "VOD", "SERIES"
     val tvArchive: Int = 0,
     val tvArchiveDuration: Int = 0,
-    val trailerId: String = ""
+    val trailerId: String = "",
+    val isAdult: Boolean = false
 )
 
 data class CategoryItem(
     val id: String,
-    val name: String
+    val name: String,
+    val isAdult: Boolean = false
 )
 
 data class AccountInfo(
@@ -215,6 +231,11 @@ fun NeoTvApp() {
     var username by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var password by remember { mutableStateOf(prefs.getString("pass", "") ?: "") }
 
+    // CONTRÔLE PARENTAL (Code par défaut : 0000)
+    var parentalPin by remember { mutableStateOf(prefs.getString("parental_pin", "0000") ?: "0000") }
+    var parentalEnabled by remember { mutableStateOf(prefs.getBoolean("parental_enabled", true)) }
+    var pendingPinAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+
     var accountInfo by remember { mutableStateOf(AccountInfo()) }
 
     var liveChannels by remember { mutableStateOf<List<MediaEntry>>(emptyList()) }
@@ -243,7 +264,6 @@ fun NeoTvApp() {
     var selectedTab by rememberSaveable { mutableStateOf(0) }
     var selectedCatId by rememberSaveable { mutableStateOf("ALL") }
     var searchQuery by rememberSaveable { mutableStateOf("") }
-    val liveListState = rememberSaveable(saver = LazyListState.Saver) { LazyListState() }
     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
 
     var showSettings by remember { mutableStateOf(false) }
@@ -261,6 +281,14 @@ fun NeoTvApp() {
     var seriesTrailer by remember { mutableStateOf("") }
     var seriesPlot by remember { mutableStateOf("") }
     var isSeriesLoading by remember { mutableStateOf(false) }
+
+    fun runWithParentalCheck(isAdult: Boolean, action: () -> Unit) {
+        if (parentalEnabled && isAdult) {
+            pendingPinAction = action
+        } else {
+            action()
+        }
+    }
 
     fun toggleFavorite(id: String) {
         val next = favorites.toMutableSet()
@@ -300,22 +328,25 @@ fun NeoTvApp() {
                 statusText = "Vérification de l'abonnement..."
                 accountInfo = fetchAccountInfo(serverUrl, username, password)
 
-                statusText = "Synchronisation TV en direct & Guide TV..."
-                val liveRes = fetchXtreamLive(context, serverUrl, username, password, forceRefresh)
+                statusText = "Synchronisation TV en direct..."
+                val liveRes = fetchXtreamLiveStreaming(context, serverUrl, username, password, forceRefresh)
                 liveCategories = liveRes.first
                 liveChannels = liveRes.second
+                System.gc()
 
                 statusText = "Synchronisation Films..."
-                val vodRes = fetchXtreamVod(context, serverUrl, username, password, forceRefresh)
+                val vodRes = fetchXtreamVodStreaming(context, serverUrl, username, password, forceRefresh)
                 vodCategories = vodRes.first
                 vodMovies = vodRes.second
+                System.gc()
 
                 statusText = "Synchronisation Séries..."
-                val serRes = fetchXtreamSeries(context, serverUrl, username, password, forceRefresh)
+                val serRes = fetchXtreamSeriesStreaming(context, serverUrl, username, password, forceRefresh)
                 seriesCategories = serRes.first
                 seriesList = serRes.second
-            } catch (e: Exception) {
-                errorMsg = "Erreur réseau : vérifiez vos identifiants (${e.localizedMessage})"
+                System.gc()
+            } catch (e: Throwable) {
+                errorMsg = "Erreur de chargement : ${e.localizedMessage}"
             } finally {
                 isLoading = false
                 statusText = ""
@@ -325,6 +356,19 @@ fun NeoTvApp() {
 
     LaunchedEffect(Unit) {
         loadAllXtreamData(forceRefresh = false)
+    }
+
+    // FENÊTRE DE VÉRIFICATION DU CODE PARENTAL (18+)
+    if (pendingPinAction != null) {
+        ParentalPinPromptDialog(
+            expectedPin = parentalPin,
+            onSuccess = {
+                val act = pendingPinAction
+                pendingPinAction = null
+                act?.invoke()
+            },
+            onDismiss = { pendingPinAction = null }
+        )
     }
 
     when {
@@ -341,13 +385,19 @@ fun NeoTvApp() {
                 username = username,
                 password = password,
                 liveChannelList = if (currentMedia.type == "LIVE") {
-                    liveChannels.filter { selectedCatId == "ALL" || selectedCatId == "FAV" || it.categoryId == selectedCatId }
+                    liveChannels.filter {
+                        if (selectedCatId == "ALL") !it.isAdult
+                        else if (selectedCatId == "FAV") favorites.contains(it.id)
+                        else it.categoryId == selectedCatId
+                    }
                 } else emptyList(),
                 onSwitchChannel = { nextChannel ->
-                    loadEpgForChannel(nextChannel.id)
-                    customStreamOverride = null
-                    startPositionMs = 0L
-                    playingMedia = nextChannel
+                    runWithParentalCheck(nextChannel.isAdult) {
+                        loadEpgForChannel(nextChannel.id)
+                        customStreamOverride = null
+                        startPositionMs = 0L
+                        playingMedia = nextChannel
+                    }
                 },
                 onPlayReplayProgram = { prog ->
                     val replayUrl = buildCatchupUrl(serverUrl, username, password, currentMedia.id, prog.startTimestamp, prog.stopTimestamp)
@@ -424,6 +474,16 @@ fun NeoTvApp() {
                 initialUser = username,
                 initialPass = password,
                 accountInfo = accountInfo,
+                parentalEnabled = parentalEnabled,
+                currentPin = parentalPin,
+                onUpdateParental = { enabled, newPin ->
+                    parentalEnabled = enabled
+                    parentalPin = newPin
+                    prefs.edit()
+                        .putBoolean("parental_enabled", enabled)
+                        .putString("parental_pin", newPin)
+                        .apply()
+                },
                 onSave = { srv, usr, pwd ->
                     serverUrl = srv.trim().removeSuffix("/")
                     username = usr.trim()
@@ -463,11 +523,16 @@ fun NeoTvApp() {
                     }
                 },
                 selectedCatId = selectedCatId,
-                onChangeCategory = { selectedCatId = it },
+                onChangeCategory = { catId, isAdultCat ->
+                    runWithParentalCheck(isAdultCat) {
+                        selectedCatId = catId
+                    }
+                },
                 searchQuery = searchQuery,
                 onChangeSearch = { searchQuery = it },
                 gridState = gridState,
                 accountInfo = accountInfo,
+                parentalEnabled = parentalEnabled,
                 liveChannels = liveChannels,
                 liveCategories = liveCategories,
                 vodMovies = vodMovies,
@@ -486,38 +551,42 @@ fun NeoTvApp() {
                 onRefreshCatalog = { loadAllXtreamData(forceRefresh = true) },
                 onOpenSettings = { showSettings = true },
                 onPlayReplayFromGrid = { ch, prog ->
-                    val replayUrl = buildCatchupUrl(serverUrl, username, password, ch.id, prog.startTimestamp, prog.stopTimestamp)
-                    customStreamOverride = replayUrl
-                    playingMedia = ch
+                    runWithParentalCheck(ch.isAdult) {
+                        val replayUrl = buildCatchupUrl(serverUrl, username, password, ch.id, prog.startTimestamp, prog.stopTimestamp)
+                        customStreamOverride = replayUrl
+                        playingMedia = ch
+                    }
                 },
                 onSelectMedia = { entry ->
-                    when (entry.type) {
-                        "SERIES" -> {
-                            selectedSeries = entry
-                            isSeriesLoading = true
-                            scope.launch {
-                                val info = fetchSeriesEpisodesAndInfo(serverUrl, username, password, entry.id)
-                                seriesEpisodes = info.first
-                                seriesPlot = info.second
-                                seriesTrailer = info.third
-                                isSeriesLoading = false
+                    runWithParentalCheck(entry.isAdult) {
+                        when (entry.type) {
+                            "SERIES" -> {
+                                selectedSeries = entry
+                                isSeriesLoading = true
+                                scope.launch {
+                                    val info = fetchSeriesEpisodesAndInfo(serverUrl, username, password, entry.id)
+                                    seriesEpisodes = info.first
+                                    seriesPlot = info.second
+                                    seriesTrailer = info.third
+                                    isSeriesLoading = false
+                                }
                             }
-                        }
-                        "VOD" -> {
-                            selectedMovieForDetails = entry
-                            movieDetails = null
-                            isMovieDetailsLoading = true
-                            scope.launch {
-                                val rawId = entry.id.removePrefix("vod_")
-                                movieDetails = fetchVodInfo(serverUrl, username, password, rawId)
-                                isMovieDetailsLoading = false
+                            "VOD" -> {
+                                selectedMovieForDetails = entry
+                                movieDetails = null
+                                isMovieDetailsLoading = true
+                                scope.launch {
+                                    val rawId = entry.id.removePrefix("vod_")
+                                    movieDetails = fetchVodInfo(serverUrl, username, password, rawId)
+                                    isMovieDetailsLoading = false
+                                }
                             }
-                        }
-                        else -> {
-                            loadEpgForChannel(entry.id)
-                            customStreamOverride = null
-                            startPositionMs = 0L
-                            playingMedia = entry
+                            else -> {
+                                loadEpgForChannel(entry.id)
+                                customStreamOverride = null
+                                startPositionMs = 0L
+                                playingMedia = entry
+                            }
                         }
                     }
                 }
@@ -531,11 +600,12 @@ fun MainScreen(
     selectedTab: Int,
     onChangeTab: (Int) -> Unit,
     selectedCatId: String,
-    onChangeCategory: (String) -> Unit,
+    onChangeCategory: (String, Boolean) -> Unit,
     searchQuery: String,
     onChangeSearch: (String) -> Unit,
     gridState: LazyGridState,
     accountInfo: AccountInfo,
+    parentalEnabled: Boolean,
     liveChannels: List<MediaEntry>,
     liveCategories: List<CategoryItem>,
     vodMovies: List<MediaEntry>,
@@ -556,8 +626,8 @@ fun MainScreen(
     onPlayReplayFromGrid: (MediaEntry, EpgProgram) -> Unit,
     onSelectMedia: (MediaEntry) -> Unit
 ) {
-    // VRAIS NOMS SOBRES ET OFFICIELS (Sans aucune marque externe)
     val tabs = listOf("Accueil", "TV en direct", "Films", "Séries", "Favoris")
+    var showSearchDialog by remember { mutableStateOf(false) }
 
     val currentCategories = when (selectedTab) {
         1 -> liveCategories
@@ -566,7 +636,8 @@ fun MainScreen(
         else -> emptyList()
     }
 
-    val currentList = remember(selectedTab, liveChannels, vodMovies, seriesList, favorites, selectedCatId, searchQuery) {
+    // Dans "Tout (ALL)", si le contrôle parental est actif, on masque automatiquement les contenus adultes (ils n'apparaissent que si on déverrouille leur catégorie 18+)
+    val currentList = remember(selectedTab, liveChannels, vodMovies, seriesList, favorites, selectedCatId, searchQuery, parentalEnabled) {
         val base = when (selectedTab) {
             1 -> if (selectedCatId == "FAV") liveChannels.filter { favorites.contains(it.id) } else liveChannels
             2 -> vodMovies
@@ -575,10 +646,26 @@ fun MainScreen(
             else -> liveChannels
         }
         base.filter { item ->
-            val matchCat = selectedCatId == "ALL" || selectedCatId == "FAV" || item.categoryId == selectedCatId
+            val matchCat = when (selectedCatId) {
+                "ALL" -> if (parentalEnabled) !item.isAdult else true
+                "FAV" -> true
+                else -> item.categoryId == selectedCatId
+            }
             val matchSearch = searchQuery.isBlank() || item.title.contains(searchQuery, ignoreCase = true)
             matchCat && matchSearch
         }
+    }
+
+    // FENÊTRE DE RECHERCHE QUI S'OUVRE UNIQUEMENT AU CLIC SUR LA BARRE DE RECHERCHE !
+    if (showSearchDialog) {
+        SearchModalDialog(
+            initialQuery = searchQuery,
+            onConfirmSearch = { newQuery ->
+                onChangeSearch(newQuery)
+                showSearchDialog = false
+            },
+            onDismiss = { showSearchDialog = false }
+        )
     }
 
     Column(
@@ -663,23 +750,44 @@ fun MainScreen(
             Text(it, color = Color(0xFFEF4444), fontSize = 12.sp)
         }
 
+        // NOUVELLE BARRE DE RECHERCHE ANTI-CLAVIER INTEMPESTIF :
+        // Descendre avec la télécommande ne déclenche PAS le clavier virtuel ! Il faut cliquer sur OK pour l'ouvrir.
         if (selectedTab != 1) {
-            OutlinedTextField(
-                value = searchQuery,
-                onValueChange = onChangeSearch,
-                placeholder = { Text("Rechercher une chaîne, un film ou une série...", color = Color(0xFF64748B), fontSize = 12.sp) },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF38BDF8)) },
-                trailingIcon = {
-                    if (searchQuery.isNotEmpty()) {
-                        IconButton(onClick = { onChangeSearch("") }) {
-                            Icon(Icons.Default.Clear, contentDescription = "Effacer", tint = Color.Gray)
-                        }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .tvFocusableClick(
+                        RoundedCornerShape(12.dp),
+                        onClick = { showSearchDialog = true }
+                    )
+                    .background(Color(0xFF151A24))
+                    .padding(horizontal = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = if (searchQuery.isEmpty()) "Rechercher une chaîne, un film ou une série (Appuyez sur OK)..." else "Recherche active : $searchQuery",
+                        color = if (searchQuery.isEmpty()) Color(0xFF94A3B8) else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = if (searchQuery.isEmpty()) FontWeight.Normal else FontWeight.Bold
+                    )
+                }
+
+                if (searchQuery.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .tvFocusableClick(CircleShape, onClick = { onChangeSearch("") })
+                            .background(Color(0xFF262F40))
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("Effacer ✕", color = Color(0xFFEF4444), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
-                },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().height(48.dp),
-                shape = RoundedCornerShape(12.dp)
-            )
+                }
+            }
 
             Spacer(modifier = Modifier.height(6.dp))
 
@@ -689,10 +797,15 @@ fun MainScreen(
                     modifier = Modifier.padding(bottom = 6.dp)
                 ) {
                     item {
-                        CategoryChip("Tout (${currentList.size})", selectedCatId == "ALL") { onChangeCategory("ALL") }
+                        CategoryChip("Tout (${currentList.size})", selectedCatId == "ALL") {
+                            onChangeCategory("ALL", false)
+                        }
                     }
                     items(currentCategories) { cat ->
-                        CategoryChip(cat.name, selectedCatId == cat.id) { onChangeCategory(cat.id) }
+                        val label = if (cat.isAdult) "🔒 ${cat.name}" else cat.name
+                        CategoryChip(label, selectedCatId == cat.id) {
+                            onChangeCategory(cat.id, cat.isAdult)
+                        }
                     }
                 }
             }
@@ -701,13 +814,11 @@ fun MainScreen(
         when (selectedTab) {
             0 -> {
                 HomeDashboard(
-                    liveChannels = liveChannels.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
-                    vodMovies = vodMovies.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
-                    seriesList = seriesList.filter { searchQuery.isBlank() || it.title.contains(searchQuery, true) },
+                    liveChannels = liveChannels.filter { (!parentalEnabled || !it.isAdult) && (searchQuery.isBlank() || it.title.contains(searchQuery, true)) },
+                    vodMovies = vodMovies.filter { (!parentalEnabled || !it.isAdult) && (searchQuery.isBlank() || it.title.contains(searchQuery, true)) },
+                    seriesList = seriesList.filter { (!parentalEnabled || !it.isAdult) && (searchQuery.isBlank() || it.title.contains(searchQuery, true)) },
                     resumeItems = resumeItems,
                     prefs = prefs,
-                    epgCache = epgCache,
-                    onRequestEpg = onRequestEpg,
                     onSelectMedia = onSelectMedia,
                     onSelectTab = onChangeTab
                 )
@@ -716,7 +827,7 @@ fun MainScreen(
                 TvGuideScreen(
                     categories = liveCategories,
                     selectedCatId = selectedCatId,
-                    onSelectCategory = onChangeCategory,
+                    onSelectCategory = { catId, isAdultCat -> onChangeCategory(catId, isAdultCat) },
                     channels = currentList,
                     epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
@@ -737,15 +848,122 @@ fun MainScreen(
     }
 }
 
+// --- FENÊTRE DE SAISIE DE RECHERCHE (S'ouvre uniquement quand on clique sur la barre de recherche) ---
+@Composable
+fun SearchModalDialog(
+    initialQuery: String,
+    onConfirmSearch: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var text by remember { mutableStateOf(initialQuery) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF151A24),
+        title = { Text("Rechercher un programme", color = Color.White, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    placeholder = { Text("Tapez un titre...", color = Color(0xFF64748B)) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onConfirmSearch(text.trim()) },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
+            ) {
+                Text("Rechercher", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (initialQuery.isNotEmpty()) {
+                    OutlinedButton(onClick = { onConfirmSearch("") }) {
+                        Text("Tout effacer", color = Color(0xFFEF4444))
+                    }
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Annuler", color = Color.White)
+                }
+            }
+        }
+    )
+}
+
+// --- FENÊTRE DU CODE PARENTAL (18+) ---
+@Composable
+fun ParentalPinPromptDialog(
+    expectedPin: String,
+    onSuccess: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var enteredPin by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF151A24),
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFACC15))
+                Text("Contrôle Parental (18+)", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Veuillez entrer votre code PIN parental pour déverrouiller ce contenu :", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                OutlinedTextField(
+                    value = enteredPin,
+                    onValueChange = {
+                        enteredPin = it
+                        error = false
+                    },
+                    label = { Text("Code PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (error) {
+                    Text("Code PIN incorrect !", color = Color(0xFFEF4444), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (enteredPin == expectedPin) {
+                        onSuccess()
+                    } else {
+                        error = true
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
+            ) {
+                Text("Déverrouiller", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Annuler", color = Color.White)
+            }
+        }
+    )
+}
+
 // =========================================================================
-// 1. GUIDE TV HORIZONTAL PARFAITEMENT CALIBRÉ SUR L'HEURE ACTUELLE
+// 1. GUIDE TV HORIZONTAL CALIBRÉ + PROTECTION ADULTE
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
     categories: List<CategoryItem>,
     selectedCatId: String,
-    onSelectCategory: (String) -> Unit,
+    onSelectCategory: (String, Boolean) -> Unit,
     channels: List<MediaEntry>,
     epgCache: Map<String, List<EpgProgram>>,
     onRequestEpg: (String) -> Unit,
@@ -776,13 +994,11 @@ fun TvGuideScreen(
     }
 
     val nowSec = System.currentTimeMillis() / 1000L
-    // Point de départ de la grille : pile sur la demi-heure en cours (ex: 22:30)
     val timelineStartSec = remember { (nowSec / 1800L) * 1800L }
-    val timelineEndSec = remember { timelineStartSec + 6 * 3600L } // 6 heures de visibilité
+    val timelineEndSec = remember { timelineStartSec + 6 * 3600L }
 
-    // Échelle exacte : 1 minute = 4.dp -> 30 minutes = 120.dp exactement !
     val dpPerMinute = 4f
-    val slotWidthDp = (30 * dpPerMinute).dp // 120.dp par tranche de 30 min
+    val slotWidthDp = (30 * dpPerMinute).dp
 
     val timeSlots = remember(timelineStartSec) {
         val sdf = SimpleDateFormat("HH:mm", Locale.FRANCE)
@@ -798,7 +1014,7 @@ fun TvGuideScreen(
     val horizontalScrollState = rememberScrollState()
 
     Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
-        // COLONNE GAUCHE : CATÉGORIES
+        // COLONNE GAUCHE : CATÉGORIES AVEC CADENAS SUR LES CATÉGORIES ADULTES
         LazyColumn(
             modifier = Modifier
                 .width(165.dp)
@@ -808,21 +1024,20 @@ fun TvGuideScreen(
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             item {
-                CategoryRowItem("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV") }
+                CategoryRowItem("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
             }
             item {
-                CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL") }
+                CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL", false) }
             }
             items(categories) { cat ->
-                CategoryRowItem(cat.name, selectedCatId == cat.id) { onSelectCategory(cat.id) }
+                val display = if (cat.isAdult) "🔒 ${cat.name}" else cat.name
+                CategoryRowItem(display, selectedCatId == cat.id) { onSelectCategory(cat.id, cat.isAdult) }
             }
         }
 
         Spacer(modifier = Modifier.width(8.dp))
 
-        // PARTIE DROITE : APERÇU EN HAUT + GRILLE ALIGNÉE EN BAS
         Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-            // HAUT : MINI-LECTEUR VIDÉO + DESCRIPTION DU PROGRAMME EN COURS
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -852,7 +1067,6 @@ fun TvGuideScreen(
                     )
                 }
 
-                // Trouve automatiquement l'émission en cours à l'heure actuelle
                 val currentChannelProgs = previewChannel?.let { epgCache[it.id] } ?: emptyList()
                 val activeProg = highlightedProgram
                     ?: currentChannelProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
@@ -919,7 +1133,6 @@ fun TvGuideScreen(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // BARRE DES HORAIRES ALIGNÉE AU PIXEL PRÈS (120.dp par tranche de 30 min)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -944,7 +1157,6 @@ fun TvGuideScreen(
                 }
             }
 
-            // LIGNES DES CHAÎNES + PROGRAMMES ALIGNÉS SUR LA GRILLE HORAIRE
             LazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
@@ -952,7 +1164,6 @@ fun TvGuideScreen(
                 itemsIndexed(channels, key = { _, ch -> ch.id }) { index, ch ->
                     LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
                     val allProgs = epgCache[ch.id] ?: emptyList()
-                    // On ne garde que les émissions qui ne sont pas encore terminées au début de la grille !
                     val visibleProgs = remember(allProgs, timelineStartSec) {
                         allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
                     }
@@ -965,7 +1176,6 @@ fun TvGuideScreen(
                             .background(if (isPlayingInMini) Color(0xFF1E293B) else Color(0xFF111622)),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // COLONNE NOM & LOGO DE LA CHAÎNE
                         Row(
                             modifier = Modifier
                                 .width(218.dp)
@@ -1025,7 +1235,6 @@ fun TvGuideScreen(
                             }
                         }
 
-                        // CASES HORIZONTALES DES PROGRAMMES PROPORTIONNELLES À LEUR DURÉE RÉELLE DANS LA TRANCHE HORAIRE
                         Row(
                             modifier = Modifier
                                 .horizontalScroll(horizontalScrollState)
@@ -1036,7 +1245,7 @@ fun TvGuideScreen(
                                 repeat(6) {
                                     Box(
                                         modifier = Modifier
-                                            .width(slotWidthDp * 2) // 1 heure
+                                            .width(slotWidthDp * 2)
                                             .fillMaxHeight()
                                             .padding(1.dp)
                                             .clip(RoundedCornerShape(4.dp))
@@ -1053,7 +1262,6 @@ fun TvGuideScreen(
                                 }
                             } else {
                                 visibleProgs.forEach { prog ->
-                                    // On tronque le début du programme s'il a commencé avant le début de la grille pour qu'il soit parfaitement aligné avec les heures en haut !
                                     val effectiveStart = prog.startTimestamp.coerceAtLeast(timelineStartSec)
                                     val effectiveStop = prog.stopTimestamp.coerceAtMost(timelineEndSec)
                                     val effectiveMinutes = ((effectiveStop - effectiveStart) / 60L).coerceAtLeast(10L)
@@ -1131,7 +1339,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM AVEC VRAI DÉGRADÉ FLUIDE SANS CASSURE (TEXTURE_VIEW + 8 PALIERS)
+// 2. FICHE FILM AVEC DÉGRADÉ BAS 100 % OPAQUE (ZÉRO BANDE CLAIRE EN BAS !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1155,7 +1363,7 @@ fun MovieDetailScreen(
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
             prepare()
-            seekTo(480_000L) // Extrait à 8 min du film
+            seekTo(480_000L)
             playWhenReady = true
             volume = 0.8f
         }
@@ -1170,11 +1378,11 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // VIDÉO EN TEXTURE_VIEW SUR TOUTE LA LARGEUR AVEC DÉGRADÉ DOUX EN 8 PALIERS (ZÉRO BANDE NETTE !)
+        // L'APERÇU VIDÉO S'ARRÊTE À 70% DE LA HAUTEUR ET FOND À 100% DANS LE NOIR EN BAS !
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(360.dp)
+                .fillMaxHeight(0.70f)
                 .align(Alignment.TopEnd)
         ) {
             AndroidView(
@@ -1187,40 +1395,39 @@ fun MovieDetailScreen(
                 modifier = Modifier.fillMaxSize()
             )
 
-            // Vrai dégradé horizontal multi-paliers ultra-progressif (de gauche à droite)
+            // Dégradé horizontal de gauche à droite
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.horizontalGradient(
                             0.00f to Color(0xFF0B0E14),
-                            0.22f to Color(0xFF0B0E14),
-                            0.35f to Color(0xE60B0E14),
-                            0.48f to Color(0xB30B0E14),
-                            0.62f to Color(0x660B0E14),
-                            0.78f to Color(0x220B0E14),
+                            0.25f to Color(0xFF0B0E14),
+                            0.42f to Color(0xE60B0E14),
+                            0.58f to Color(0x990B0E14),
+                            0.75f to Color(0x330B0E14),
                             1.00f to Color.Transparent
                         )
                     )
             )
 
-            // Vrai dégradé vertical progressif (fond le haut et le bas dans le noir de la page)
+            // Dégradé vertical renforcé en bas : devient 100% opaque dès 80% de la boîte vidéo !
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            0.00f to Color(0x880B0E14),
-                            0.25f to Color.Transparent,
-                            0.65f to Color(0x660B0E14),
-                            0.85f to Color(0xCC0B0E14),
+                            0.00f to Color(0x990B0E14),
+                            0.20f to Color.Transparent,
+                            0.50f to Color(0x770B0E14),
+                            0.72f to Color(0xDD0B0E14),
+                            0.84f to Color(0xFF0B0E14),
                             1.00f to Color(0xFF0B0E14)
                         )
                     )
             )
         }
 
-        // CONTENU DE LA FICHE FILM
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1364,7 +1571,7 @@ fun MovieDetailScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xCC151A24))
+                        .background(Color(0xFF151A24))
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
@@ -1391,7 +1598,7 @@ fun MovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE AVEC VRAI DÉGRADÉ FLUIDE + BANDE-ANNONCE + SAISONS
+// 3. FICHE SÉRIE AVEC DÉGRADÉ BAS 100 % OPAQUE (ZÉRO BANDE CLAIRE EN BAS !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1440,10 +1647,11 @@ fun SeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
+        // L'APERÇU VIDÉO S'ARRÊTE À 65% DE LA HAUTEUR ET FOND TOTALEMENT DANS LE NOIR AVANT LE BAS !
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(320.dp)
+                .fillMaxHeight(0.65f)
                 .align(Alignment.TopEnd)
         ) {
             AndroidView(
@@ -1473,9 +1681,11 @@ fun SeriesDetailScreen(
                     .fillMaxSize()
                     .background(
                         Brush.verticalGradient(
-                            0.00f to Color(0x660B0E14),
-                            0.40f to Color.Transparent,
-                            0.80f to Color(0xCC0B0E14),
+                            0.00f to Color(0x880B0E14),
+                            0.25f to Color.Transparent,
+                            0.55f to Color(0x990B0E14),
+                            0.78f to Color(0xEE0B0E14),
+                            0.88f to Color(0xFF0B0E14),
                             1.00f to Color(0xFF0B0E14)
                         )
                     )
@@ -1544,7 +1754,7 @@ fun SeriesDetailScreen(
                                     previewPlayer.pause()
                                     onPlayEpisode(ep)
                                 })
-                                .background(Color(0xDD151A24))
+                                .background(Color(0xFF151A24))
                                 .padding(14.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
@@ -1569,8 +1779,6 @@ fun HomeDashboard(
     seriesList: List<MediaEntry>,
     resumeItems: List<MediaEntry>,
     prefs: android.content.SharedPreferences,
-    epgCache: Map<String, List<EpgProgram>>,
-    onRequestEpg: (String) -> Unit,
     onSelectMedia: (MediaEntry) -> Unit,
     onSelectTab: (Int) -> Unit
 ) {
@@ -2271,12 +2479,18 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
+// =========================================================================
+// 4. ÉCRAN PARAMÈTRES AVEC CONTRÔLE PARENTAL & CHANGEMENT DE MOT DE PASSE PIN
+// =========================================================================
 @Composable
 fun IptvSetupScreen(
     initialServer: String,
     initialUser: String,
     initialPass: String,
     accountInfo: AccountInfo,
+    parentalEnabled: Boolean,
+    currentPin: String,
+    onUpdateParental: (Boolean, String) -> Unit,
     onSave: (String, String, String) -> Unit,
     onCancel: () -> Unit
 ) {
@@ -2284,6 +2498,21 @@ fun IptvSetupScreen(
     var server by remember { mutableStateOf(initialServer) }
     var user by remember { mutableStateOf(initialUser) }
     var pass by remember { mutableStateOf(initialPass) }
+
+    var showChangePinDialog by remember { mutableStateOf(false) }
+    var pinChangeMessage by remember { mutableStateOf<String?>(null) }
+
+    if (showChangePinDialog) {
+        ChangeParentalPinDialog(
+            currentPin = currentPin,
+            onPinChanged = { newPin ->
+                onUpdateParental(parentalEnabled, newPin)
+                showChangePinDialog = false
+                pinChangeMessage = "Votre code parental a bien été modifié !"
+            },
+            onDismiss = { showChangePinDialog = false }
+        )
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -2293,9 +2522,10 @@ fun IptvSetupScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Text("Paramètres & Abonnement", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text("Paramètres, Abonnement & Contrôle Parental", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
 
+        // BLOC 1 : INFORMATIONS D'ABONNEMENT
         item {
             Column(
                 modifier = Modifier
@@ -2313,6 +2543,51 @@ fun IptvSetupScreen(
             }
         }
 
+        // BLOC 2 : CONTRÔLE PARENTAL (18+) & CHANGEMENT DE MOT DE PASSE
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF151A24))
+                    .border(1.dp, Color(0xFFA855F7), RoundedCornerShape(14.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("🔒 Contrôle Parental (Contenus Adultes 18+)", color = Color(0xFFA855F7), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text("Verrouille les catégories et contenus adultes par mot de passe (par défaut : 0000)", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                    }
+                    Switch(
+                        checked = parentalEnabled,
+                        onCheckedChange = { newState ->
+                            onUpdateParental(newState, currentPin)
+                        }
+                    )
+                }
+
+                pinChangeMessage?.let {
+                    Text(it, color = Color(0xFF4ADE80), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+
+                Button(
+                    onClick = { showChangePinDialog = true },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF262F40)),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFACC15), modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Modifier le code PIN / Mot de passe parental", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+        }
+
+        // BLOC 3 : IDENTIFIANTS XTREAM CODES
         item {
             OutlinedTextField(
                 value = server,
@@ -2357,7 +2632,312 @@ fun IptvSetupScreen(
     }
 }
 
-// --- MOTEUR RÉSEAU XTREAM CODES & CALIBRAGE EXACT DES HORAIRES EPG ---
+@Composable
+fun ChangeParentalPinDialog(
+    currentPin: String,
+    onPinChanged: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var oldPin by remember { mutableStateOf("") }
+    var newPin by remember { mutableStateOf("") }
+    var errorMsg by remember { mutableStateOf<String?>(null) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF151A24),
+        title = { Text("Modifier le mot de passe parental", color = Color.White, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = oldPin,
+                    onValueChange = { oldPin = it; errorMsg = null },
+                    label = { Text("Ancien code PIN (0000 par défaut)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = newPin,
+                    onValueChange = { newPin = it; errorMsg = null },
+                    label = { Text("Nouveau code PIN") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                errorMsg?.let {
+                    Text(it, color = Color(0xFFEF4444), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    when {
+                        oldPin != currentPin -> errorMsg = "L'ancien code PIN est incorrect."
+                        newPin.length < 4 -> errorMsg = "Le nouveau code doit contenir au moins 4 caractères."
+                        else -> onPinChanged(newPin)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
+            ) {
+                Text("Valider", color = Color.White, fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Annuler", color = Color.White)
+            }
+        }
+    )
+}
+
+// =========================================================================
+// 5. MOTEUR RÉSEAU EN STREAMING (JSONREADER) ANTI-CRASH MÉMOIRE FIRE STICK 4K
+// =========================================================================
+
+fun downloadUrlToFile(urlStr: String, destFile: File) {
+    val url = URL(urlStr)
+    val conn = (url.openConnection() as HttpURLConnection).apply {
+        requestMethod = "GET"
+        connectTimeout = 20000
+        readTimeout = 45000
+        setRequestProperty("User-Agent", "NeoTV/6.0 (ExoPlayer)")
+    }
+    conn.inputStream.use { input ->
+        destFile.outputStream().use { output ->
+            input.copyTo(output, bufferSize = 16 * 1024)
+        }
+    }
+}
+
+fun getCachedOrDownloadFile(context: Context, cacheKey: String, url: String, forceRefresh: Boolean): File {
+    val file = File(context.cacheDir, cacheKey)
+    if (!forceRefresh && file.exists() && file.length() > 10L && (System.currentTimeMillis() - file.lastModified() < 6 * 3600 * 1000L)) {
+        return file
+    }
+    downloadUrlToFile(url, file)
+    return file
+}
+
+fun JsonReader.readNextStringSafe(): String {
+    return when (peek()) {
+        JsonToken.STRING -> nextString()
+        JsonToken.NUMBER -> nextString()
+        JsonToken.BOOLEAN -> nextBoolean().toString()
+        JsonToken.NULL -> {
+            nextNull()
+            ""
+        }
+        else -> {
+            skipValue()
+            ""
+        }
+    }
+}
+
+fun JsonReader.readNextIntSafe(): Int {
+    return when (peek()) {
+        JsonToken.NUMBER -> runCatching { nextInt() }.getOrDefault(0)
+        JsonToken.STRING -> nextString().toIntOrNull() ?: 0
+        JsonToken.NULL -> {
+            nextNull()
+            0
+        }
+        else -> {
+            skipValue()
+            0
+        }
+    }
+}
+
+fun parseCategoryFileStreaming(file: File): LinkedHashMap<String, CategoryItem> {
+    val map = LinkedHashMap<String, CategoryItem>()
+    if (!file.exists()) return map
+    try {
+        JsonReader(BufferedReader(InputStreamReader(FileInputStream(file), Charsets.UTF_8))).use { reader ->
+            if (reader.peek() != JsonToken.BEGIN_ARRAY) return map
+            reader.beginArray()
+            while (reader.hasNext()) {
+                reader.beginObject()
+                var id = ""
+                var name = "Général"
+                while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                        "category_id" -> id = reader.readNextStringSafe()
+                        "category_name" -> name = reader.readNextStringSafe()
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+                if (id.isNotBlank()) {
+                    map[id] = CategoryItem(id, name, isAdultText(name))
+                }
+            }
+            reader.endArray()
+        }
+    } catch (_: Throwable) {}
+    return map
+}
+
+suspend fun fetchXtreamLiveStreaming(
+    context: Context,
+    baseUrl: String,
+    user: String,
+    pass: String,
+    forceRefresh: Boolean
+): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
+    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
+    val catFile = getCachedOrDownloadFile(context, "live_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_categories", forceRefresh)
+    val catMap = parseCategoryFileStreaming(catFile)
+
+    val streamFile = getCachedOrDownloadFile(context, "live_streams.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_streams", forceRefresh)
+    val list = ArrayList<MediaEntry>(4000)
+
+    JsonReader(BufferedReader(InputStreamReader(FileInputStream(streamFile), Charsets.UTF_8))).use { reader ->
+        if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+                reader.beginObject()
+                var id = ""
+                var name = ""
+                var logo = ""
+                var catId = ""
+                var tvArchive = 0
+                var tvArchiveDur = 0
+                var isAdultFlag = 0
+
+                while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                        "stream_id" -> id = reader.readNextStringSafe()
+                        "name" -> name = reader.readNextStringSafe()
+                        "stream_icon" -> logo = reader.readNextStringSafe()
+                        "category_id" -> catId = reader.readNextStringSafe()
+                        "tv_archive" -> tvArchive = reader.readNextIntSafe()
+                        "tv_archive_duration" -> tvArchiveDur = reader.readNextIntSafe()
+                        "is_adult" -> isAdultFlag = reader.readNextIntSafe()
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+
+                if (id.isNotBlank()) {
+                    val catItem = catMap[catId]
+                    val catName = catItem?.name ?: "TV"
+                    val isAdult = (isAdultFlag == 1) || (catItem?.isAdult == true) || isAdultText(name)
+                    val url = "$cleanBase/live/$user/$pass/$id.ts"
+                    list.add(MediaEntry(id, name.ifBlank { "Chaîne $id" }, catId, catName, logo, url, "LIVE", tvArchive, tvArchiveDur, isAdult = isAdult))
+                }
+            }
+            reader.endArray()
+        }
+    }
+    Pair(catMap.values.toList(), list)
+}
+
+suspend fun fetchXtreamVodStreaming(
+    context: Context,
+    baseUrl: String,
+    user: String,
+    pass: String,
+    forceRefresh: Boolean
+): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
+    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
+    val catFile = getCachedOrDownloadFile(context, "vod_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_categories", forceRefresh)
+    val catMap = parseCategoryFileStreaming(catFile)
+
+    val vodFile = getCachedOrDownloadFile(context, "vod_streams.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_streams", forceRefresh)
+    val list = ArrayList<MediaEntry>(8000)
+
+    JsonReader(BufferedReader(InputStreamReader(FileInputStream(vodFile), Charsets.UTF_8))).use { reader ->
+        if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+                reader.beginObject()
+                var id = ""
+                var name = ""
+                var logo = ""
+                var catId = ""
+                var ext = "mp4"
+                var trailer = ""
+                var isAdultFlag = 0
+
+                while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                        "stream_id" -> id = reader.readNextStringSafe()
+                        "name" -> name = reader.readNextStringSafe()
+                        "stream_icon" -> logo = reader.readNextStringSafe()
+                        "category_id" -> catId = reader.readNextStringSafe()
+                        "container_extension" -> ext = reader.readNextStringSafe().ifBlank { "mp4" }
+                        "youtube_trailer" -> trailer = reader.readNextStringSafe()
+                        "is_adult" -> isAdultFlag = reader.readNextIntSafe()
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+
+                if (id.isNotBlank()) {
+                    val catItem = catMap[catId]
+                    val catName = catItem?.name ?: "Cinéma"
+                    val isAdult = (isAdultFlag == 1) || (catItem?.isAdult == true) || isAdultText(name)
+                    val url = "$cleanBase/movie/$user/$pass/$id.$ext"
+                    list.add(MediaEntry("vod_$id", name.ifBlank { "Film $id" }, catId, catName, logo, url, "VOD", trailerId = trailer, isAdult = isAdult))
+                }
+            }
+            reader.endArray()
+        }
+    }
+    Pair(catMap.values.toList(), list)
+}
+
+suspend fun fetchXtreamSeriesStreaming(
+    context: Context,
+    baseUrl: String,
+    user: String,
+    pass: String,
+    forceRefresh: Boolean
+): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
+    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
+    val catFile = getCachedOrDownloadFile(context, "series_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_series_categories", forceRefresh)
+    val catMap = parseCategoryFileStreaming(catFile)
+
+    val serFile = getCachedOrDownloadFile(context, "series_list.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_series", forceRefresh)
+    val list = ArrayList<MediaEntry>(4000)
+
+    JsonReader(BufferedReader(InputStreamReader(FileInputStream(serFile), Charsets.UTF_8))).use { reader ->
+        if (reader.peek() == JsonToken.BEGIN_ARRAY) {
+            reader.beginArray()
+            while (reader.hasNext()) {
+                reader.beginObject()
+                var id = ""
+                var name = ""
+                var cover = ""
+                var catId = ""
+                var trailer = ""
+
+                while (reader.hasNext()) {
+                    when (reader.nextName()) {
+                        "series_id" -> id = reader.readNextStringSafe()
+                        "name" -> name = reader.readNextStringSafe()
+                        "cover" -> cover = reader.readNextStringSafe()
+                        "category_id" -> catId = reader.readNextStringSafe()
+                        "youtube_trailer" -> trailer = reader.readNextStringSafe()
+                        else -> reader.skipValue()
+                    }
+                }
+                reader.endObject()
+
+                if (id.isNotBlank()) {
+                    val catItem = catMap[catId]
+                    val catName = catItem?.name ?: "Série"
+                    val isAdult = (catItem?.isAdult == true) || isAdultText(name)
+                    list.add(MediaEntry(id, name.ifBlank { "Série $id" }, catId, catName, cover, "", "SERIES", trailerId = trailer, isAdult = isAdult))
+                }
+            }
+            reader.endArray()
+        }
+    }
+    Pair(catMap.values.toList(), list)
+}
 
 suspend fun fetchAccountInfo(baseUrl: String, user: String, pass: String): AccountInfo = withContext(Dispatchers.IO) {
     try {
@@ -2385,106 +2965,6 @@ fun buildCatchupUrl(baseUrl: String, user: String, pass: String, streamId: Strin
     val sdf = SimpleDateFormat("yyyy-MM-dd:HH-mm", Locale.US)
     val startFormatted = sdf.format(Date(startSec * 1000L))
     return "$cleanBase/timeshift/$user/$pass/$durationMin/$startFormatted/$streamId.ts"
-}
-
-fun fetchWithDiskCache(context: Context, cacheKey: String, url: String, forceRefresh: Boolean): String {
-    val file = File(context.cacheDir, cacheKey)
-    if (!forceRefresh && file.exists() && (System.currentTimeMillis() - file.lastModified() < 6 * 3600 * 1000L)) {
-        return file.readText()
-    }
-    val fresh = httpGet(url)
-    if (fresh.startsWith("[") || fresh.startsWith("{")) {
-        file.writeText(fresh)
-    }
-    return fresh
-}
-
-suspend fun fetchXtreamLive(
-    context: Context,
-    baseUrl: String,
-    user: String,
-    pass: String,
-    forceRefresh: Boolean
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catJson = fetchWithDiskCache(context, "live_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_categories", forceRefresh)
-    val catMap = parseCategoryMap(catJson)
-
-    val streamJson = fetchWithDiskCache(context, "live_streams.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_live_streams", forceRefresh)
-    val arr = JSONArray(streamJson)
-    val list = ArrayList<MediaEntry>(arr.length())
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("stream_id")
-        val name = obj.optString("name", "Chaîne $id")
-        val logo = obj.optString("stream_icon", "")
-        val catId = obj.optString("category_id")
-        val tvArchive = obj.optInt("tv_archive", 0)
-        val tvArchiveDur = obj.optInt("tv_archive_duration", 0)
-        val catName = catMap[catId] ?: "TV"
-        val url = "$cleanBase/live/$user/$pass/$id.ts"
-        list.add(MediaEntry(id, name, catId, catName, logo, url, "LIVE", tvArchive, tvArchiveDur))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
-}
-
-suspend fun fetchXtreamVod(
-    context: Context,
-    baseUrl: String,
-    user: String,
-    pass: String,
-    forceRefresh: Boolean
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catJson = fetchWithDiskCache(context, "vod_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_categories", forceRefresh)
-    val catMap = parseCategoryMap(catJson)
-
-    val vodJson = fetchWithDiskCache(context, "vod_streams.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_vod_streams", forceRefresh)
-    val arr = JSONArray(vodJson)
-    val list = ArrayList<MediaEntry>(arr.length())
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("stream_id")
-        val name = obj.optString("name", "Film $id")
-        val logo = obj.optString("stream_icon", "")
-        val catId = obj.optString("category_id")
-        val ext = obj.optString("container_extension", "mp4").ifBlank { "mp4" }
-        val trailer = obj.optString("youtube_trailer", "")
-        val catName = catMap[catId] ?: "Cinéma"
-        val url = "$cleanBase/movie/$user/$pass/$id.$ext"
-        list.add(MediaEntry("vod_$id", name, catId, catName, logo, url, "VOD", trailerId = trailer))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
-}
-
-suspend fun fetchXtreamSeries(
-    context: Context,
-    baseUrl: String,
-    user: String,
-    pass: String,
-    forceRefresh: Boolean
-): Pair<List<CategoryItem>, List<MediaEntry>> = withContext(Dispatchers.IO) {
-    val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-    val catJson = fetchWithDiskCache(context, "series_cats.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_series_categories", forceRefresh)
-    val catMap = parseCategoryMap(catJson)
-
-    val serJson = fetchWithDiskCache(context, "series_list.json", "$cleanBase/player_api.php?username=$user&password=$pass&action=get_series", forceRefresh)
-    val arr = JSONArray(serJson)
-    val list = ArrayList<MediaEntry>(arr.length())
-
-    for (i in 0 until arr.length()) {
-        val obj = arr.getJSONObject(i)
-        val id = obj.optString("series_id")
-        val name = obj.optString("name", "Série $id")
-        val cover = obj.optString("cover", "")
-        val catId = obj.optString("category_id")
-        val trailer = obj.optString("youtube_trailer", "")
-        val catName = catMap[catId] ?: "Série"
-        list.add(MediaEntry(id, name, catId, catName, cover, "", "SERIES", trailerId = trailer))
-    }
-    Pair(catMap.map { CategoryItem(it.key, it.value) }, list)
 }
 
 suspend fun fetchVodInfo(baseUrl: String, user: String, pass: String, vodId: String): VodDetails = withContext(Dispatchers.IO) {
@@ -2545,7 +3025,6 @@ suspend fun fetchSeriesEpisodesAndInfo(
     }
 }
 
-// Lecture et calibrage intelligent de l'EPG (corrige les fuseaux horaires et trie par heure exacte)
 suspend fun fetchChannelEpgList(
     baseUrl: String,
     user: String,
@@ -2604,27 +3083,13 @@ fun decodeBase64IfPossible(input: String): String {
     }
 }
 
-fun parseCategoryMap(jsonStr: String): LinkedHashMap<String, String> {
-    val map = LinkedHashMap<String, String>()
-    return try {
-        val arr = JSONArray(jsonStr)
-        for (i in 0 until arr.length()) {
-            val obj = arr.getJSONObject(i)
-            map[obj.optString("category_id")] = obj.optString("category_name", "Général")
-        }
-        map
-    } catch (e: Exception) {
-        map
-    }
-}
-
 fun httpGet(urlStr: String): String {
     val url = URL(urlStr)
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/5.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.0 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
