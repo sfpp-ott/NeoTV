@@ -66,6 +66,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
@@ -78,6 +79,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+
+// =========================================================================
+// CONFIGURATION DU PANEL D'URLS À DISTANCE
+// =========================================================================
+const val REMOTE_PANEL_URLS_JSON = "https://raw.githubusercontent.com/sfpp-ott/NeoTV/main/panel_urls.json"
+val DEFAULT_PROVIDER_URLS = listOf(
+    "http://votre-serveur-principal.com:8080"
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -252,7 +261,7 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
-    var epgCache by remember { mutableStateOf<Map<String, List<EpgProgram>>>(emptyMap()) }
+    var epgCache by remember { mutableStateOf>>(emptyMap()) }
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
@@ -317,11 +326,17 @@ fun NeoTvApp() {
     }
 
     fun loadAllXtreamData(forceRefresh: Boolean = false) {
-        if (serverUrl.isBlank() || username.isBlank()) return
+        if (username.isBlank()) return
         isLoading = true
         errorMsg = null
         scope.launch {
             try {
+                if (serverUrl.isBlank()) {
+                    statusText = "Recherche du serveur autorisé..."
+                    serverUrl = resolveAuthorizedServerForUser(username, password, "")
+                    prefs.edit().putString("server", serverUrl).apply()
+                }
+
                 statusText = "Vérification de l'abonnement..."
                 accountInfo = fetchAccountInfo(serverUrl, username, password)
 
@@ -343,7 +358,7 @@ fun NeoTvApp() {
                 seriesList = serRes.second
                 System.gc()
             } catch (e: Throwable) {
-                errorMsg = "Erreur de chargement : ${e.localizedMessage}"
+                errorMsg = "Erreur de chargement : vérifiez vos identifiants (${e.localizedMessage})"
             } finally {
                 isLoading = false
                 statusText = ""
@@ -403,6 +418,10 @@ fun NeoTvApp() {
                 onSaveProgress = { pos, dur ->
                     if (currentMedia.type != "LIVE") {
                         saveWatchProgress(currentMedia.id, pos, dur)
+                        // Si c'est un épisode de série (categoryId contient l'ID de la série), on met aussi à jour la progression globale de la série !
+                        if (currentMedia.id.startsWith("ep_") && currentMedia.categoryId.isNotBlank()) {
+                            saveWatchProgress(currentMedia.categoryId, pos, dur)
+                        }
                     }
                 },
                 onBack = {
@@ -440,22 +459,35 @@ fun NeoTvApp() {
         }
         selectedSeries != null -> {
             val serie = selectedSeries!!
+            val lastEpId = prefs.getString("last_ep_id_${serie.id}", "") ?: ""
+
             SeriesDetailScreen(
                 series = serie,
                 episodes = seriesEpisodes,
                 plot = seriesPlot,
                 isLoading = isSeriesLoading,
+                prefs = prefs,
+                lastPlayedEpId = lastEpId,
+                isFavorite = favorites.contains(serie.id),
+                onToggleFav = { toggleFavorite(serie.id) },
                 onBack = { selectedSeries = null },
                 onWatchTrailer = {
                     openTrailerYoutube(context, serie.title, seriesTrailer.ifBlank { serie.trailerId })
                 },
                 onPlayEpisode = { ep ->
-                    startPositionMs = prefs.getLong("pos_ep_${ep.id}", 0L)
+                    val epKey = "ep_${ep.id}"
+                    startPositionMs = prefs.getLong("pos_$epKey", 0L)
                     customStreamOverride = null
+                    prefs.edit()
+                        .putString("last_ep_id_${serie.id}", ep.id)
+                        .putString("last_ep_label_${serie.id}", "S${ep.season} • ${ep.title}")
+                        .apply()
+                    saveWatchProgress(serie.id, startPositionMs.coerceAtLeast(10000L), 3600000L)
+
                     playingMedia = MediaEntry(
-                        id = "ep_${ep.id}",
+                        id = epKey,
                         title = "${serie.title} - S${ep.season} : ${ep.title}",
-                        categoryId = "",
+                        categoryId = serie.id,
                         categoryName = "Série",
                         logoUrl = serie.logoUrl,
                         streamUrl = ep.streamUrl,
@@ -504,9 +536,17 @@ fun NeoTvApp() {
                 }
             }
 
-            val resumeItems = remember(watchHistoryIds, vodMovies, liveChannels) {
-                val allMedia = (vodMovies + liveChannels).associateBy { it.id }
-                watchHistoryIds.mapNotNull { allMedia[it] }
+            // Historique complet incluant Films, Chaînes ET Séries (avec affichage du dernier épisode visionné)
+            val resumeItems = remember(watchHistoryIds, vodMovies, liveChannels, seriesList) {
+                val allMedia = (vodMovies + liveChannels + seriesList).associateBy { it.id }
+                watchHistoryIds.mapNotNull { id ->
+                    allMedia[id]?.let { entry ->
+                        if (entry.type == "SERIES") {
+                            val lastEpLabel = prefs.getString("last_ep_label_${entry.id}", "") ?: ""
+                            if (lastEpLabel.isNotBlank()) entry.copy(title = "${entry.title} ($lastEpLabel)") else entry
+                        } else entry
+                    }
+                }
             }
 
             MainScreen(
@@ -641,9 +681,10 @@ fun MainScreen(
             else -> liveChannels
         }
         base.filter { item ->
-            val matchCat = when (selectedCatId) {
-                "ALL" -> if (parentalEnabled) !item.isAdult else true
-                "FAV" -> true
+            val matchCat = when {
+                selectedCatId == "ALL" -> if (parentalEnabled) !item.isAdult else true
+                selectedCatId == "FAV" -> true
+                selectedCatId.startsWith("CUSTOM_") -> true
                 else -> item.categoryId == selectedCatId
             }
             val matchSearch = searchQuery.isBlank() || item.title.contains(searchQuery, ignoreCase = true)
@@ -651,12 +692,18 @@ fun MainScreen(
         }
     }
 
+    // FENÊTRE DE RECHERCHE INSTANTANÉE LETTRE PAR LETTRE AVEC APERÇU DIRECT DES RÉSULTATS
     if (showSearchDialog) {
-        SearchModalDialog(
+        val allSearchable = remember(liveChannels, vodMovies, seriesList, parentalEnabled) {
+            (vodMovies + seriesList + liveChannels).filter { !parentalEnabled || !it.isAdult }
+        }
+        InstantSearchModalDialog(
             initialQuery = searchQuery,
-            onConfirmSearch = { newQuery ->
-                onChangeSearch(newQuery)
+            allItems = allSearchable,
+            onQueryChanged = { liveQuery -> onChangeSearch(liveQuery) },
+            onSelectResult = { chosen ->
                 showSearchDialog = false
+                onSelectMedia(chosen)
             },
             onDismiss = { showSearchDialog = false }
         )
@@ -717,7 +764,7 @@ fun MainScreen(
                         .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = if (liveChannels.isEmpty()) "Paramètres" else "Exp: ${accountInfo.expDateFormatted}",
+                        text = if (liveChannels.isEmpty()) "Connexion" else "Exp: ${accountInfo.expDateFormatted}",
                         color = Color.White,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
@@ -761,7 +808,7 @@ fun MainScreen(
                     Icon(Icons.Default.Search, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = if (searchQuery.isEmpty()) "Rechercher une chaîne, un film ou une série (Appuyez sur OK)..." else "Recherche active : $searchQuery",
+                        text = if (searchQuery.isEmpty()) "Rechercher un film, une série ou une chaîne (Appuyez sur OK)..." else "Filtre actif : $searchQuery",
                         color = if (searchQuery.isEmpty()) Color(0xFF94A3B8) else Color.White,
                         fontSize = 13.sp,
                         fontWeight = if (searchQuery.isEmpty()) FontWeight.Normal else FontWeight.Bold
@@ -820,6 +867,8 @@ fun MainScreen(
                     selectedCatId = selectedCatId,
                     onSelectCategory = { catId, isAdultCat -> onChangeCategory(catId, isAdultCat) },
                     channels = currentList,
+                    favorites = favorites,
+                    onToggleFav = onToggleFav,
                     epgCache = epgCache,
                     onRequestEpg = onRequestEpg,
                     onPlayChannelFullscreen = onSelectMedia,
@@ -839,46 +888,108 @@ fun MainScreen(
     }
 }
 
+// =========================================================================
+// RECHERCHE INSTANTANÉE LETTRE PAR LETTRE AVEC RÉSULTATS EN DIRECT
+// =========================================================================
 @Composable
-fun SearchModalDialog(
+fun InstantSearchModalDialog(
     initialQuery: String,
-    onConfirmSearch: (String) -> Unit,
+    allItems: List<MediaEntry>,
+    onQueryChanged: (String) -> Unit,
+    onSelectResult: (MediaEntry) -> Unit,
     onDismiss: () -> Unit
 ) {
     var text by remember { mutableStateOf(initialQuery) }
 
+    val matchingResults = remember(text, allItems) {
+        val q = text.trim()
+        if (q.isEmpty()) emptyList()
+        else allItems.asSequence()
+            .filter { it.title.contains(q, ignoreCase = true) }
+            .take(30)
+            .toList()
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = Color(0xFF151A24),
-        title = { Text("Rechercher un programme", color = Color.White, fontWeight = FontWeight.Bold) },
+        title = {
+            Text("Recherche instantanée", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 17.sp)
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.fillMaxWidth().heightIn(max = 360.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 OutlinedTextField(
                     value = text,
-                    onValueChange = { text = it },
-                    placeholder = { Text("Tapez un titre...", color = Color(0xFF64748B)) },
+                    onValueChange = { newText ->
+                        text = newText
+                        onQueryChanged(newText.trim())
+                    },
+                    placeholder = { Text("Tapez les premières lettres...", color = Color(0xFF64748B), fontSize = 13.sp) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
+
+                if (text.trim().isNotEmpty()) {
+                    Text(
+                        text = "${matchingResults.size} résultat(s) immédiat(s) :",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().weight(1f, fill = false),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        items(matchingResults, key = { it.id }) { item ->
+                            val badge = when (item.type) {
+                                "VOD" -> "🎬 FILM"
+                                "SERIES" -> "📺 SÉRIE"
+                                else -> "🔴 TV"
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .tvFocusableClick(RoundedCornerShape(8.dp), onClick = { onSelectResult(item) })
+                                    .background(Color(0xFF0B0E14))
+                                    .padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                AsyncImage(
+                                    model = item.logoUrl,
+                                    contentDescription = item.title,
+                                    modifier = Modifier.size(38.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF1E293B)),
+                                    contentScale = ContentScale.Crop
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(item.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("$badge • ${item.categoryName}", color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 1)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         },
         confirmButton = {
             Button(
-                onClick = { onConfirmSearch(text.trim()) },
+                onClick = onDismiss,
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
             ) {
-                Text("Rechercher", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("Fermer", color = Color.White, fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (initialQuery.isNotEmpty()) {
-                    OutlinedButton(onClick = { onConfirmSearch("") }) {
-                        Text("Tout effacer", color = Color(0xFFEF4444))
-                    }
-                }
-                TextButton(onClick = onDismiss) {
-                    Text("Annuler", color = Color.White)
+            if (text.isNotEmpty()) {
+                OutlinedButton(onClick = {
+                    text = ""
+                    onQueryChanged("")
+                }) {
+                    Text("Effacer", color = Color(0xFFEF4444))
                 }
             }
         }
@@ -944,6 +1055,9 @@ fun ParentalPinPromptDialog(
     )
 }
 
+// =========================================================================
+// 1. GUIDE TV HORIZONTAL AVEC FAVORIS + CRÉATION DE GROUPES PERSONNALISÉS
+// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
@@ -951,19 +1065,48 @@ fun TvGuideScreen(
     selectedCatId: String,
     onSelectCategory: (String, Boolean) -> Unit,
     channels: List<MediaEntry>,
+    favorites: Set<String>,
+    onToggleFav: (String) -> Unit,
     epgCache: Map<String, List<EpgProgram>>,
     onRequestEpg: (String) -> Unit,
     onPlayChannelFullscreen: (MediaEntry) -> Unit,
     onPlayReplayProgram: (MediaEntry, EpgProgram) -> Unit
 ) {
     val context = LocalContext.current
-    var previewChannel by remember(channels) { mutableStateOf(channels.firstOrNull()) }
+    val prefs = remember { context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE) }
+
+    var customGroupNames by remember {
+        mutableStateOf(prefs.getStringSet("custom_groups", emptySet())?.toSet() ?: emptySet())
+    }
+    var groupUpdateTick by remember { mutableStateOf(0) }
+    var showCreateGroupDialog by remember { mutableStateOf(false) }
+    var channelToAssignGroup by remember { mutableStateOf<MediaEntry?>(null) }
+
+    fun addOrRemoveChannelInGroup(groupName: String, channelId: String) {
+        val key = "group_members_$groupName"
+        val current = prefs.getStringSet(key, emptySet())?.toMutableSet() ?: mutableSetOf()
+        if (current.contains(channelId)) current.remove(channelId) else current.add(channelId)
+        prefs.edit().putStringSet(key, current).apply()
+        groupUpdateTick++
+    }
+
+    val displayedChannels = remember(channels, selectedCatId, favorites, customGroupNames, groupUpdateTick) {
+        when {
+            selectedCatId == "FAV" -> channels.filter { favorites.contains(it.id) }
+            selectedCatId.startsWith("CUSTOM_") -> {
+                val gName = selectedCatId.removePrefix("CUSTOM_")
+                val members = prefs.getStringSet("group_members_$gName", emptySet()) ?: emptySet()
+                channels.filter { members.contains(it.id) }
+            }
+            else -> channels
+        }
+    }
+
+    var previewChannel by remember(displayedChannels) { mutableStateOf(displayedChannels.firstOrNull()) }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
     val miniPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
-            volume = 1f
-        }
+        ExoPlayer.Builder(context).build().apply { volume = 1f }
     }
 
     LaunchedEffect(previewChannel?.streamUrl) {
@@ -977,6 +1120,106 @@ fun TvGuideScreen(
 
     DisposableEffect(Unit) {
         onDispose { miniPlayer.release() }
+    }
+
+    if (showCreateGroupDialog) {
+        var newGroupName by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showCreateGroupDialog = false },
+            containerColor = Color(0xFF151A24),
+            title = { Text("Créer un nouveau groupe TV", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                OutlinedTextField(
+                    value = newGroupName,
+                    onValueChange = { newGroupName = it },
+                    label = { Text("Nom du groupe (ex: Sport, Enfants, Soirée...)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val clean = newGroupName.trim()
+                        if (clean.isNotEmpty()) {
+                            val next = customGroupNames + clean
+                            customGroupNames = next
+                            prefs.edit().putStringSet("custom_groups", next).apply()
+                        }
+                        showCreateGroupDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6))
+                ) {
+                    Text("Créer", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCreateGroupDialog = false }) {
+                    Text("Annuler", color = Color.White)
+                }
+            }
+        )
+    }
+
+    if (channelToAssignGroup != null) {
+        val ch = channelToAssignGroup!!
+        AlertDialog(
+            onDismissRequest = { channelToAssignGroup = null },
+            containerColor = Color(0xFF151A24),
+            title = { Text("Favoris & Groupes : ${ch.title}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp) },
+            text = {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item {
+                        val isFav = favorites.contains(ch.id)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                                    onToggleFav(ch.id)
+                                    channelToAssignGroup = null
+                                })
+                                .background(if (isFav) Color(0xFF8B5CF6) else Color(0xFF0B0E14))
+                                .padding(12.dp)
+                        ) {
+                            Text(if (isFav) "⭐ Retirer des Favoris" else "⭐ Ajouter aux Favoris", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    items(customGroupNames.toList()) { gName ->
+                        val members = prefs.getStringSet("group_members_$gName", emptySet()) ?: emptySet()
+                        val isInGroup = members.contains(ch.id)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                                    addOrRemoveChannelInGroup(gName, ch.id)
+                                    channelToAssignGroup = null
+                                })
+                                .background(if (isInGroup) Color(0xFF38BDF8) else Color(0xFF0B0E14))
+                                .padding(12.dp)
+                        ) {
+                            Text(
+                                text = if (isInGroup) "📁 Retirer du groupe « $gName »" else "📁 Ajouter au groupe « $gName »",
+                                color = if (isInGroup) Color.Black else Color.White,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    channelToAssignGroup = null
+                    showCreateGroupDialog = true
+                }) {
+                    Text("+ Nouveau groupe", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { channelToAssignGroup = null }) {
+                    Text("Fermer", color = Color.White)
+                }
+            }
+        )
     }
 
     val nowSec = System.currentTimeMillis() / 1000L
@@ -1002,14 +1245,22 @@ fun TvGuideScreen(
     Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
         LazyColumn(
             modifier = Modifier
-                .width(165.dp)
+                .width(172.dp)
                 .fillMaxHeight()
                 .background(Color(0xFF0E131B))
                 .padding(6.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             item {
-                CategoryRowItem("⭐ Favoris", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
+                CategoryRowItem("➕ Créer un groupe", false) { showCreateGroupDialog = true }
+            }
+            item {
+                CategoryRowItem("⭐ Favoris (${favorites.size})", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
+            }
+            items(customGroupNames.toList()) { gName ->
+                CategoryRowItem("📁 $gName", selectedCatId == "CUSTOM_$gName") {
+                    onSelectCategory("CUSTOM_$gName", false)
+                }
             }
             item {
                 CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL", false) }
@@ -1107,7 +1358,7 @@ fun TvGuideScreen(
                             fontSize = 12.sp
                         )
                         Text(
-                            text = "Cliquez une deuxième fois sur la chaîne ou sur l'aperçu vidéo pour passer en plein écran.",
+                            text = "Cliquez sur ⭐ à gauche d'une chaîne pour l'ajouter en Favori ou dans un Groupe personnalisé.",
                             color = Color(0xFF94A3B8),
                             fontSize = 12.sp,
                             maxLines = 2
@@ -1130,7 +1381,7 @@ fun TvGuideScreen(
                     color = Color(0xFF38BDF8),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    modifier = Modifier.width(210.dp)
+                    modifier = Modifier.width(240.dp)
                 )
 
                 Row(modifier = Modifier.horizontalScroll(horizontalScrollState)) {
@@ -1146,13 +1397,14 @@ fun TvGuideScreen(
                 modifier = Modifier.fillMaxSize(),
                 verticalArrangement = Arrangement.spacedBy(3.dp)
             ) {
-                itemsIndexed(channels, key = { _, ch -> ch.id }) { index, ch ->
+                itemsIndexed(displayedChannels, key = { _, ch -> ch.id }) { index, ch ->
                     LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
                     val allProgs = epgCache[ch.id] ?: emptyList()
                     val visibleProgs = remember(allProgs, timelineStartSec) {
                         allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
                     }
                     val isPlayingInMini = previewChannel?.id == ch.id
+                    val isFav = favorites.contains(ch.id)
 
                     Row(
                         modifier = Modifier
@@ -1161,9 +1413,28 @@ fun TvGuideScreen(
                             .background(if (isPlayingInMini) Color(0xFF1E293B) else Color(0xFF111622)),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // BOUTON ÉTOILE (FAVORIS & GROUPES) SUR CHAQUE CHAÎNE
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .tvFocusableClick(
+                                    RoundedCornerShape(6.dp),
+                                    defaultBorderWidth = 0.dp,
+                                    onClick = { channelToAssignGroup = ch }
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                contentDescription = "Favori / Groupe",
+                                tint = if (isFav) Color(0xFFFACC15) else Color(0xFF64748B),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
                         Row(
                             modifier = Modifier
-                                .width(218.dp)
+                                .width(206.dp)
                                 .fillMaxHeight()
                                 .tvFocusableClick(
                                     RoundedCornerShape(6.dp),
@@ -1181,26 +1452,26 @@ fun TvGuideScreen(
                                         }
                                     }
                                 )
-                                .padding(horizontal = 8.dp),
+                                .padding(horizontal = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
                                 text = "${index + 1}",
                                 color = Color(0xFF94A3B8),
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold,
-                                modifier = Modifier.width(28.dp)
+                                modifier = Modifier.width(24.dp)
                             )
                             AsyncImage(
                                 model = ch.logoUrl,
                                 contentDescription = ch.title,
                                 modifier = Modifier
-                                    .size(30.dp)
+                                    .size(28.dp)
                                     .clip(RoundedCornerShape(4.dp))
                                     .background(Color.Black),
                                 contentScale = ContentScale.Fit
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = ch.title,
                                 color = Color.White,
@@ -1215,7 +1486,7 @@ fun TvGuideScreen(
                                     Icons.Default.History,
                                     contentDescription = "Replay",
                                     tint = Color(0xFF38BDF8),
-                                    modifier = Modifier.size(14.dp)
+                                    modifier = Modifier.size(13.dp)
                                 )
                             }
                         }
@@ -1324,7 +1595,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
+// 2. FICHE FILM : DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE EN BAS !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1363,7 +1634,6 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // 1. LA VIDÉO D'APERÇU
         AndroidView(
             factory = { ctx ->
                 (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
@@ -1374,40 +1644,35 @@ fun MovieDetailScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN (Noir à gauche -> Transparent à droite)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     Brush.horizontalGradient(
                         0.00f to Color(0xFF0B0E14),
-                        0.24f to Color(0xFF0B0E14),
-                        0.42f to Color(0xE60B0E14),
-                        0.58f to Color(0x990B0E14),
-                        0.75f to Color(0x330B0E14),
+                        0.28f to Color(0xFF0B0E14),
+                        0.50f to Color(0xCC0B0E14),
+                        0.75f to Color(0x440B0E14),
                         1.00f to Color.Transparent
                     )
                 )
         )
 
-        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Transparent en haut -> Noir 100% massif sur tout le bas de l'écran)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
-                        0.00f to Color(0x880B0E14),
-                        0.18f to Color.Transparent,
-                        0.40f to Color(0x660B0E14),
-                        0.54f to Color(0xCC0B0E14),
-                        0.66f to Color(0xF50B0E14),
+                        0.00f to Color(0x660B0E14),
+                        0.20f to Color.Transparent,
+                        0.45f to Color(0x660B0E14),
+                        0.62f to Color(0xDD0B0E14),
                         0.74f to Color(0xFF0B0E14),
                         1.00f to Color(0xFF0B0E14)
                     )
                 )
         )
 
-        // 4. CONTENU DE LA FICHE FILM PAR-DESSUS LE FOND DÉGRADÉ
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1578,7 +1843,7 @@ fun MovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
+// 3. FICHE SÉRIE AVEC HISTORIQUE PAR ÉPISODE + BOUTON REPRENDRE + DÉGRADÉ
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1587,6 +1852,10 @@ fun SeriesDetailScreen(
     episodes: List<EpisodeItem>,
     plot: String,
     isLoading: Boolean,
+    prefs: android.content.SharedPreferences,
+    lastPlayedEpId: String,
+    isFavorite: Boolean,
+    onToggleFav: () -> Unit,
     onBack: () -> Unit,
     onWatchTrailer: () -> Unit,
     onPlayEpisode: (EpisodeItem) -> Unit
@@ -1596,9 +1865,10 @@ fun SeriesDetailScreen(
     var selectedSeason by remember { mutableStateOf<Int?>(null) }
     val seasons = remember(episodes) { episodes.map { it.season }.distinct().sorted() }
 
-    LaunchedEffect(seasons) {
+    LaunchedEffect(seasons, lastPlayedEpId) {
         if (selectedSeason == null && seasons.isNotEmpty()) {
-            selectedSeason = seasons.first()
+            val lastEpSeason = episodes.firstOrNull { it.id == lastPlayedEpId }?.season
+            selectedSeason = lastEpSeason ?: seasons.first()
         }
     }
 
@@ -1627,7 +1897,6 @@ fun SeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // 1. VIDÉO D'APERÇU DE LA SÉRIE
         AndroidView(
             factory = { ctx ->
                 (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
@@ -1638,7 +1907,6 @@ fun SeriesDetailScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -1646,30 +1914,28 @@ fun SeriesDetailScreen(
                     Brush.horizontalGradient(
                         0.00f to Color(0xFF0B0E14),
                         0.28f to Color(0xFF0B0E14),
-                        0.48f to Color(0xCC0B0E14),
-                        0.72f to Color(0x550B0E14),
+                        0.50f to Color(0xCC0B0E14),
+                        0.75f to Color(0x440B0E14),
                         1.00f to Color.Transparent
                     )
                 )
         )
 
-        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Fond totalement dans le noir #0B0E14 avant le bas)
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
-                        0.00f to Color(0x880B0E14),
-                        0.18f to Color.Transparent,
-                        0.38f to Color(0x880B0E14),
-                        0.52f to Color(0xE60B0E14),
-                        0.64f to Color(0xFF0B0E14),
+                        0.00f to Color(0x660B0E14),
+                        0.20f to Color.Transparent,
+                        0.45f to Color(0x660B0E14),
+                        0.62f to Color(0xDD0B0E14),
+                        0.74f to Color(0xFF0B0E14),
                         1.00f to Color(0xFF0B0E14)
                     )
                 )
         )
 
-        // 4. CONTENU DE LA SÉRIE
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1692,17 +1958,46 @@ fun SeriesDetailScreen(
                     }
                 }
 
-                Button(
-                    onClick = {
-                        previewPlayer.pause()
-                        onWatchTrailer()
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val resumeEp = episodes.firstOrNull { it.id == lastPlayedEpId }
+                    if (resumeEp != null) {
+                        Button(
+                            onClick = {
+                                previewPlayer.pause()
+                                onPlayEpisode(resumeEp)
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reprendre S${resumeEp.season}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            previewPlayer.pause()
+                            onWatchTrailer()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+
+                    IconButton(
+                        onClick = onToggleFav,
+                        modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                    ) {
+                        Icon(
+                            imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                            contentDescription = "Favori",
+                            tint = if (isFavorite) Color(0xFFFACC15) else Color.White
+                        )
+                    }
                 }
             }
 
@@ -1725,23 +2020,47 @@ fun SeriesDetailScreen(
                 val filteredEps = episodes.filter { selectedSeason == null || it.season == selectedSeason }
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(filteredEps) { ep ->
-                        Row(
+                        val epPos = prefs.getLong("pos_ep_${ep.id}", 0L)
+                        val epDur = prefs.getLong("dur_ep_${ep.id}", 1L).coerceAtLeast(1L)
+                        val hasStarted = epPos > 10000L
+                        val isLastPlayed = ep.id == lastPlayedEpId
+                        val progress = if (hasStarted) (epPos.toFloat() / epDur.toFloat()).coerceIn(0.05f, 0.98f) else 0f
+
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .tvFocusableClick(RoundedCornerShape(10.dp), onClick = {
                                     previewPlayer.pause()
                                     onPlayEpisode(ep)
                                 })
-                                .background(Color(0xFF151A24))
-                                .padding(14.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                                .background(if (isLastPlayed) Color(0xFF1E1B4B) else Color(0xFF151A24))
+                                .padding(14.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("Saison ${ep.season}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                Text(ep.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text("Saison ${ep.season}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        if (hasStarted) {
+                                            Text("• En cours (${(epPos / 60000).toInt()} min)", color = Color(0xFFA855F7), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                    Text(ep.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
                             }
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                            if (hasStarted) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                LinearProgressIndicator(
+                                    progress = progress,
+                                    modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
+                                    color = Color(0xFFA855F7),
+                                    trackColor = Color(0xFF334155)
+                                )
+                            }
                         }
                     }
                 }
@@ -1843,17 +2162,17 @@ fun HomeDashboard(
 
         if (resumeItems.isNotEmpty()) {
             item {
-                Text("Reprendre la lecture", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                Text("Reprendre la lecture (Films & Séries)", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(10.dp))
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     items(resumeItems) { item ->
                         val pos = prefs.getLong("pos_${item.id}", 0L)
                         val dur = prefs.getLong("dur_${item.id}", 1L).coerceAtLeast(1L)
-                        val progress = (pos.toFloat() / dur.toFloat()).coerceIn(0.05f, 0.98f)
+                        val progress = (pos.toFloat() / dur.toFloat()).coerceIn(0.08f, 0.98f)
 
                         Column(
                             modifier = Modifier
-                                .width(190.dp)
+                                .width(205.dp)
                                 .tvFocusableClick(RoundedCornerShape(14.dp), onClick = { onSelectMedia(item) })
                                 .background(Color(0xFF151A24))
                                 .padding(12.dp)
@@ -1868,7 +2187,11 @@ fun HomeDashboard(
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(item.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    Text("${(progress * 100).toInt()}% visionné", color = Color(0xFF38BDF8), fontSize = 11.sp)
+                                    Text(
+                                        text = if (item.type == "SERIES") "Reprendre la série" else "${(progress * 100).toInt()}% visionné",
+                                        color = Color(0xFF38BDF8),
+                                        fontSize = 11.sp
+                                    )
                                 }
                             }
                             Spacer(modifier = Modifier.height(8.dp))
@@ -2457,6 +2780,39 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
+// =========================================================================
+// 4. ESPACE CLIENT VERROUILLÉ PAR VOTRE PANEL D'URLS + MODE ADMIN SECRET
+// =========================================================================
+suspend fun resolveAuthorizedServerForUser(user: String, pass: String, fallbackServer: String): String = withContext(Dispatchers.IO) {
+    val candidateUrls = mutableListOf<String>()
+    try {
+        val raw = httpGet(REMOTE_PANEL_URLS_JSON)
+        val arr = JSONArray(raw)
+        for (i in 0 until arr.length()) {
+            val u = arr.optString(i).trim().removeSuffix("/")
+            if (u.isNotBlank()) candidateUrls.add(u)
+        }
+    } catch (_: Exception) {}
+
+    DEFAULT_PROVIDER_URLS.forEach {
+        val clean = it.trim().removeSuffix("/")
+        if (clean.isNotBlank() && !candidateUrls.contains(clean)) candidateUrls.add(clean)
+    }
+    if (fallbackServer.isNotBlank() && !candidateUrls.contains(fallbackServer)) {
+        candidateUrls.add(fallbackServer)
+    }
+
+    for (srv in candidateUrls) {
+        try {
+            val cleanBase = if (srv.startsWith("http")) srv else "http://$srv"
+            val resp = httpGet("$cleanBase/player_api.php?username=$user&password=$pass")
+            val auth = JSONObject(resp).optJSONObject("user_info")?.optInt("auth", 0) ?: 0
+            if (auth == 1) return@withContext cleanBase
+        } catch (_: Exception) {}
+    }
+    candidateUrls.firstOrNull() ?: fallbackServer
+}
+
 @Composable
 fun IptvSetupScreen(
     initialServer: String,
@@ -2470,9 +2826,14 @@ fun IptvSetupScreen(
     onCancel: () -> Unit
 ) {
     BackHandler { onCancel() }
-    var server by remember { mutableStateOf(initialServer) }
+    val scope = rememberCoroutineScope()
     var user by remember { mutableStateOf(initialUser) }
     var pass by remember { mutableStateOf(initialPass) }
+    var isVerifyingPanel by remember { mutableStateOf(false) }
+
+    // Mode Admin caché : cliquez 5 fois sur le titre "Espace Client & Paramètres" pour afficher le champ URL Serveur
+    var adminClicks by remember { mutableStateOf(0) }
+    var customAdminServer by remember { mutableStateOf(initialServer) }
 
     var showChangePinDialog by remember { mutableStateOf(false) }
     var pinChangeMessage by remember { mutableStateOf<String?>(null) }
@@ -2497,7 +2858,79 @@ fun IptvSetupScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
-            Text("Paramètres, Abonnement & Contrôle Parental", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text = "Espace Client & Paramètres",
+                color = Color.White,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.clickable { adminClicks++ }
+            )
+        }
+
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF151A24))
+                    .border(1.dp, Color(0xFF8B5CF6), RoundedCornerShape(14.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text("Connexion à votre compte NeoTV", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                Text("Entrez simplement votre nom d'utilisateur et votre mot de passe :", color = Color(0xFF94A3B8), fontSize = 12.sp)
+
+                if (adminClicks >= 5) {
+                    OutlinedTextField(
+                        value = customAdminServer,
+                        onValueChange = { customAdminServer = it },
+                        label = { Text("🔧 [Mode Admin] URL Serveur") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                OutlinedTextField(
+                    value = user,
+                    onValueChange = { user = it },
+                    label = { Text("Nom d'utilisateur (Username)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = pass,
+                    onValueChange = { pass = it },
+                    label = { Text("Mot de passe (Password)") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Button(
+                        onClick = {
+                            isVerifyingPanel = true
+                            scope.launch {
+                                val resolvedUrl = if (adminClicks >= 5 && customAdminServer.isNotBlank()) {
+                                    customAdminServer.trim()
+                                } else {
+                                    resolveAuthorizedServerForUser(user.trim(), pass.trim(), customAdminServer.trim())
+                                }
+                                isVerifyingPanel = false
+                                onSave(resolvedUrl, user, pass)
+                            }
+                        },
+                        enabled = !isVerifyingPanel,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text(if (isVerifyingPanel) "Connexion en cours..." else "Se connecter", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
+                        Text("Retour", color = Color.White)
+                    }
+                }
+            }
         }
 
         item {
@@ -2556,48 +2989,6 @@ fun IptvSetupScreen(
                     Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFACC15), modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Modifier le code PIN / Mot de passe parental", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                }
-            }
-        }
-
-        item {
-            OutlinedTextField(
-                value = server,
-                onValueChange = { server = it },
-                label = { Text("URL du serveur (ex: http://monserveur.com:8080)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-            OutlinedTextField(
-                value = user,
-                onValueChange = { user = it },
-                label = { Text("Utilisateur (Username)") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(modifier = Modifier.height(10.dp))
-            OutlinedTextField(
-                value = pass,
-                onValueChange = { pass = it },
-                label = { Text("Mot de passe (Password)") },
-                visualTransformation = PasswordVisualTransformation(),
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
-
-        item {
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Button(
-                    onClick = { onSave(server, user, pass) },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Enregistrer & Synchroniser", color = Color.White, fontWeight = FontWeight.Bold)
-                }
-                OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
-                    Text("Retour", color = Color.White)
                 }
             }
         }
@@ -2663,13 +3054,17 @@ fun ChangeParentalPinDialog(
     )
 }
 
+// =========================================================================
+// 5. MOTEUR RÉSEAU EN STREAMING (JSONREADER) ANTI-CRASH FIRE STICK 4K
+// =========================================================================
+
 fun downloadUrlToFile(urlStr: String, destFile: File) {
     val url = URL(urlStr)
     val conn = (url.openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/7.0 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3057,7 +3452,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/7.0 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
