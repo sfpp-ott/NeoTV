@@ -8,6 +8,7 @@ import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonToken
 import android.view.LayoutInflater
+import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -39,9 +40,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -144,7 +147,7 @@ data class MediaEntry(
     val categoryName: String,
     val logoUrl: String,
     val streamUrl: String,
-    val type: String, // "LIVE", "VOD", "SERIES"
+    val type: String,
     val tvArchive: Int = 0,
     val tvArchiveDuration: Int = 0,
     val trailerId: String = "",
@@ -252,7 +255,7 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
-    var epgCache by remember { mutableStateOf<Map<String, List<EpgProgram>>>(emptyMap()) }
+    var epgCache by remember { mutableStateOf>>(emptyMap()) }
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
@@ -590,7 +593,6 @@ fun NeoTvApp() {
         }
     }
 }
-
 @Composable
 fun MainScreen(
     selectedTab: Int,
@@ -1324,7 +1326,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
+// 2. FICHE FILM : CLIP STRICT + DÉGRADÉ VERTICAL COMPLET (ZÉRO BANDE EN BAS)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1363,51 +1365,60 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // 1. LA VIDÉO D'APERÇU
-        AndroidView(
-            factory = { ctx ->
-                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                    player = previewPlayer
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN (Noir à gauche -> Transparent à droite)
+        // CONTENEUR VIDÉO VERROUILLÉ AVEC clipToBounds() POUR EMPÊCHER TOUT DÉBORDEMENT EN BAS !
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        0.00f to Color(0xFF0B0E14),
-                        0.24f to Color(0xFF0B0E14),
-                        0.42f to Color(0xE60B0E14),
-                        0.58f to Color(0x990B0E14),
-                        0.75f to Color(0x330B0E14),
-                        1.00f to Color.Transparent
-                    )
-                )
-        )
+                .fillMaxWidth()
+                .height(320.dp)
+                .align(Alignment.TopEnd)
+                .clip(RectangleShape)
+                .clipToBounds()
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                        player = previewPlayer
+                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        clipChildren = true
+                        clipToPadding = true
+                    }
+                },
+                modifier = Modifier.fillMaxSize().clipToBounds()
+            )
 
-        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Transparent en haut -> Noir 100% massif sur tout le bas de l'écran)
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        0.00f to Color(0x880B0E14),
-                        0.18f to Color.Transparent,
-                        0.40f to Color(0x660B0E14),
-                        0.54f to Color(0xCC0B0E14),
-                        0.66f to Color(0xF50B0E14),
-                        0.74f to Color(0xFF0B0E14),
-                        1.00f to Color(0xFF0B0E14)
+            // Dégradé horizontal de gauche à droite
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            0.00f to Color(0xFF0B0E14),
+                            0.25f to Color(0xFF0B0E14),
+                            0.45f to Color(0xE60B0E14),
+                            0.65f to Color(0x880B0E14),
+                            0.82f to Color(0x220B0E14),
+                            1.00f to Color.Transparent
+                        )
                     )
-                )
-        )
+            )
 
-        // 4. CONTENU DE LA FICHE FILM PAR-DESSUS LE FOND DÉGRADÉ
+            // Dégradé vertical qui devient 100% noir (#0B0E14) avant la fin de la boîte de 320.dp !
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0.00f to Color(0x880B0E14),
+                            0.20f to Color.Transparent,
+                            0.55f to Color(0x880B0E14),
+                            0.78f to Color(0xEE0B0E14),
+                            0.90f to Color(0xFF0B0E14),
+                            1.00f to Color(0xFF0B0E14)
+                        )
+                    )
+            )
+        }
+
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1578,7 +1589,7 @@ fun MovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
+// 3. FICHE SÉRIE : CLIP STRICT + DÉGRADÉ VERTICAL COMPLET (ZÉRO BANDE EN BAS)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1627,49 +1638,54 @@ fun SeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // 1. VIDÉO D'APERÇU DE LA SÉRIE
-        AndroidView(
-            factory = { ctx ->
-                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                    player = previewPlayer
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        0.00f to Color(0xFF0B0E14),
-                        0.28f to Color(0xFF0B0E14),
-                        0.48f to Color(0xCC0B0E14),
-                        0.72f to Color(0x550B0E14),
-                        1.00f to Color.Transparent
+                .fillMaxWidth()
+                .height(290.dp)
+                .align(Alignment.TopEnd)
+                .clip(RectangleShape)
+                .clipToBounds()
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                        player = previewPlayer
+                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                        clipChildren = true
+                        clipToPadding = true
+                    }
+                },
+                modifier = Modifier.fillMaxSize().clipToBounds()
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            0.00f to Color(0xFF0B0E14),
+                            0.28f to Color(0xFF0B0E14),
+                            0.48f to Color(0xCC0B0E14),
+                            0.72f to Color(0x550B0E14),
+                            1.00f to Color.Transparent
+                        )
                     )
-                )
-        )
-
-        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Fond totalement dans le noir #0B0E14 avant le bas)
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        0.00f to Color(0x880B0E14),
-                        0.18f to Color.Transparent,
-                        0.38f to Color(0x880B0E14),
-                        0.52f to Color(0xE60B0E14),
-                        0.64f to Color(0xFF0B0E14),
-                        1.00f to Color(0xFF0B0E14)
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.verticalGradient(
+                            0.00f to Color(0x880B0E14),
+                            0.20f to Color.Transparent,
+                            0.55f to Color(0x880B0E14),
+                            0.78f to Color(0xEE0B0E14),
+                            0.90f to Color(0xFF0B0E14),
+                            1.00f to Color(0xFF0B0E14)
+                        )
                     )
-                )
-        )
+            )
+        }
 
-        // 4. CONTENU DE LA SÉRIE
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -1923,7 +1939,6 @@ fun HomeDashboard(
         }
     }
 }
-
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun UltimateVideoPlayerScreen(
@@ -2669,7 +2684,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.2 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3032,7 +3047,7 @@ suspend fun fetchChannelEpgList(
             val stopFormatted = if (stopTs > 0) timeFormat.format(Date(stopTs * 1000L)) else ""
 
             if (title.isNotBlank() && stopTs > startTs) {
-                list.add(EpgProgram(title, desc, startTs, stopTs, startFormatted, stopFormatted, hasArchive))
+                list.add(EpgProgram(title, desc, startTs, stopTs, startStr = startFormatted, stopFormatted = stopFormatted, hasArchive = hasArchive))
             }
         }
         list.sortedBy { it.startTimestamp }
@@ -3057,7 +3072,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.2 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
