@@ -3047,7 +3047,7 @@ suspend fun fetchChannelEpgList(
             val stopFormatted = if (stopTs > 0) timeFormat.format(Date(stopTs * 1000L)) else ""
 
             if (title.isNotBlank() && stopTs > startTs) {
-                list.add(EpgProgram(title, desc, startTs, stopTs, startStr = startFormatted, stopFormatted = stopFormatted, hasArchive = hasArchive))
+                list.add(EpgProgram(title, desc, startTs, stopTs, startFormatted, stopFormatted, hasArchive))
             }
         }
         list.sortedBy { it.startTimestamp }
