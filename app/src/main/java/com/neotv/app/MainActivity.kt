@@ -8,7 +8,6 @@ import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonToken
 import android.view.LayoutInflater
-import android.view.ViewGroup
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -40,11 +39,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -147,7 +144,7 @@ data class MediaEntry(
     val categoryName: String,
     val logoUrl: String,
     val streamUrl: String,
-    val type: String,
+    val type: String, // "LIVE", "VOD", "SERIES"
     val tvArchive: Int = 0,
     val tvArchiveDuration: Int = 0,
     val trailerId: String = "",
@@ -255,7 +252,7 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
-    var epgCache by remember { mutableStateOf>>(emptyMap()) }
+    var epgCache by remember { mutableStateOf<Map<String, List<EpgProgram>>>(emptyMap()) }
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
@@ -593,6 +590,7 @@ fun NeoTvApp() {
         }
     }
 }
+
 @Composable
 fun MainScreen(
     selectedTab: Int,
@@ -1326,7 +1324,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM : CLIP STRICT + DÉGRADÉ VERTICAL COMPLET (ZÉRO BANDE EN BAS)
+// 2. FICHE FILM : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1365,60 +1363,51 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        // CONTENEUR VIDÉO VERROUILLÉ AVEC clipToBounds() POUR EMPÊCHER TOUT DÉBORDEMENT EN BAS !
+        // 1. LA VIDÉO D'APERÇU
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN (Noir à gauche -> Transparent à droite)
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(320.dp)
-                .align(Alignment.TopEnd)
-                .clip(RectangleShape)
-                .clipToBounds()
-        ) {
-            AndroidView(
-                factory = { ctx ->
-                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                        player = previewPlayer
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                        clipChildren = true
-                        clipToPadding = true
-                    }
-                },
-                modifier = Modifier.fillMaxSize().clipToBounds()
-            )
-
-            // Dégradé horizontal de gauche à droite
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.horizontalGradient(
-                            0.00f to Color(0xFF0B0E14),
-                            0.25f to Color(0xFF0B0E14),
-                            0.45f to Color(0xE60B0E14),
-                            0.65f to Color(0x880B0E14),
-                            0.82f to Color(0x220B0E14),
-                            1.00f to Color.Transparent
-                        )
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.24f to Color(0xFF0B0E14),
+                        0.42f to Color(0xE60B0E14),
+                        0.58f to Color(0x990B0E14),
+                        0.75f to Color(0x330B0E14),
+                        1.00f to Color.Transparent
                     )
-            )
+                )
+        )
 
-            // Dégradé vertical qui devient 100% noir (#0B0E14) avant la fin de la boîte de 320.dp !
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            0.00f to Color(0x880B0E14),
-                            0.20f to Color.Transparent,
-                            0.55f to Color(0x880B0E14),
-                            0.78f to Color(0xEE0B0E14),
-                            0.90f to Color(0xFF0B0E14),
-                            1.00f to Color(0xFF0B0E14)
-                        )
+        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Transparent en haut -> Noir 100% massif sur tout le bas de l'écran)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x880B0E14),
+                        0.18f to Color.Transparent,
+                        0.40f to Color(0x660B0E14),
+                        0.54f to Color(0xCC0B0E14),
+                        0.66f to Color(0xF50B0E14),
+                        0.74f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
                     )
-            )
-        }
+                )
+        )
 
+        // 4. CONTENU DE LA FICHE FILM PAR-DESSUS LE FOND DÉGRADÉ
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -1589,7 +1578,7 @@ fun MovieDetailScreen(
 }
 
 // =========================================================================
-// 3. FICHE SÉRIE : CLIP STRICT + DÉGRADÉ VERTICAL COMPLET (ZÉRO BANDE EN BAS)
+// 3. FICHE SÉRIE : CALQUES DE DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE !)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1638,53 +1627,402 @@ fun SeriesDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
+        // 1. VIDÉO D'APERÇU DE LA SÉRIE
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // 2. DÉGRADÉ HORIZONTAL SUR 100% DE L'ÉCRAN
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(290.dp)
-                .align(Alignment.TopEnd)
-                .clip(RectangleShape)
-                .clipToBounds()
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.28f to Color(0xFF0B0E14),
+                        0.48f to Color(0xCC0B0E14),
+                        0.72f to Color(0x550B0E14),
+                        1.00f to Color.Transparent
+                    )
+                )
+        )
+
+        // 3. DÉGRADÉ VERTICAL SUR 100% DE L'ÉCRAN (Fond totalement dans le noir #0B0E14 avant le bas)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x880B0E14),
+                        0.18f to Color.Transparent,
+                        0.38f to Color(0x880B0E14),
+                        0.52f to Color(0xE60B0E14),
+                        0.64f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
+                    )
+                )
+        )
+
+        // 4. CONTENU DE LA SÉRIE
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(18.dp)
         ) {
-            AndroidView(
-                factory = { ctx ->
-                    (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                        player = previewPlayer
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                        clipChildren = true
-                        clipToPadding = true
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                     }
-                },
-                modifier = Modifier.fillMaxSize().clipToBounds()
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.horizontalGradient(
-                            0.00f to Color(0xFF0B0E14),
-                            0.28f to Color(0xFF0B0E14),
-                            0.48f to Color(0xCC0B0E14),
-                            0.72f to Color(0x550B0E14),
-                            1.00f to Color.Transparent
-                        )
-                    )
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(
-                        Brush.verticalGradient(
-                            0.00f to Color(0x880B0E14),
-                            0.20f to Color.Transparent,
-                            0.55f to Color(0x880B0E14),
-                            0.78f to Color(0xEE0B0E14),
-                            0.90f to Color(0xFF0B0E14),
-                            1.00f to Color(0xFF0B0E14)
-                        )
-                    )
-            )
+                    Column {
+                        Text(series.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
+                        if (plot.isNotBlank()) {
+                            Text(plot, color = Color(0xFFCBD5E1), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun MovieDetailScreen(
+    movie: MediaEntry,
+    details: VodDetails?,
+    isLoading: Boolean,
+    savedPositionMs: Long,
+    isFavorite: Boolean,
+    onToggleFav: () -> Unit,
+    onPlayFromStart: () -> Unit,
+    onResumePlay: () -> Unit,
+    onWatchTrailer: () -> Unit,
+    onBack: () -> Unit
+) {
+    BackHandler { onBack() }
+    val context = LocalContext.current
+    var isMuted by remember { mutableStateOf(false) }
+
+    val previewPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
+            prepare()
+            seekTo(480_000L)
+            playWhenReady = true
+            volume = 0.8f
         }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewPlayer.release() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B0E14))
+    ) {
+        // VIDÉO D'APERÇU SUR TOUTE LA FENÊTRE
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // DÉGRADÉ HORIZONTAL (Noir à gauche -> Transparent à droite)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.30f to Color(0xFF0B0E14),
+                        0.55f to Color(0xCC0B0E14),
+                        0.80f to Color(0x440B0E14),
+                        1.00f to Color.Transparent
+                    )
+                )
+        )
+
+        // DÉGRADÉ VERTICAL INTÉGRAL (Transparent en haut -> Noir massif sur TOUT le bas de l'écran)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x660B0E14),
+                        0.25f to Color.Transparent,
+                        0.50f to Color(0x440B0E14),
+                        0.70f to Color(0xDD0B0E14),
+                        0.85f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
+                    )
+                )
+        )
+
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onBack,
+                        modifier = Modifier.clip(CircleShape).background(Color(0x88151A24))
+                    ) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        IconButton(
+                            onClick = {
+                                isMuted = !isMuted
+                                previewPlayer.volume = if (isMuted) 0f else 1f
+                            },
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                        ) {
+                            Icon(
+                                imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                                contentDescription = "Son extrait",
+                                tint = Color.White
+                            )
+                        }
+
+                        IconButton(
+                            onClick = onToggleFav,
+                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                        ) {
+                            Icon(
+                                imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                contentDescription = "Favori",
+                                tint = if (isFavorite) Color(0xFFFACC15) else Color.White
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(0.85f),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalAlignment = Alignment.Bottom
+                ) {
+                    AsyncImage(
+                        model = movie.logoUrl,
+                        contentDescription = movie.title,
+                        modifier = Modifier
+                            .width(115.dp)
+                            .height(170.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .border(1.dp, Color(0xFF334155), RoundedCornerShape(12.dp)),
+                        contentScale = ContentScale.Crop
+                    )
+
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(movie.title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold)
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            if (!details?.rating.isNullOrBlank()) {
+                                Text("⭐ ${details?.rating}/10", color = Color(0xFFFACC15), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                            }
+                            if (!details?.releaseDate.isNullOrBlank()) {
+                                Text(details?.releaseDate ?: "", color = Color(0xFFCBD5E1), fontSize = 13.sp)
+                            }
+                            if (!details?.duration.isNullOrBlank()) {
+                                Text(details?.duration ?: "", color = Color(0xFF38BDF8), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+
+                        Text(
+                            text = details?.genre?.ifBlank { movie.categoryName } ?: movie.categoryName,
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            previewPlayer.pause()
+                            onPlayFromStart()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (savedPositionMs > 10000L) "Depuis le début" else "Lecture", color = Color.Black, fontWeight = FontWeight.ExtraBold)
+                    }
+
+                    if (savedPositionMs > 10000L) {
+                        val min = (savedPositionMs / 60000).toInt()
+                        Button(
+                            onClick = {
+                                previewPlayer.pause()
+                                onResumePlay()
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Reprendre (${min}m)", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            previewPlayer.pause()
+                            onWatchTrailer()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xFF151A24))
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("Synopsis", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    if (isLoading) {
+                        Text("Chargement du résumé...", color = Color(0xFF94A3B8), fontSize = 13.sp)
+                    } else {
+                        Text(
+                            text = details?.plot?.ifBlank { "Aucun synopsis détaillé renseigné pour ce film." } ?: "",
+                            color = Color(0xFFE2E8F0),
+                            fontSize = 14.sp
+                        )
+                        if (!details?.cast.isNullOrBlank()) {
+                            Text("Distribution : ${details?.cast}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                        if (!details?.director.isNullOrBlank()) {
+                            Text("Réalisation : ${details?.director}", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+fun SeriesDetailScreen(
+    series: MediaEntry,
+    episodes: List<EpisodeItem>,
+    plot: String,
+    isLoading: Boolean,
+    onBack: () -> Unit,
+    onWatchTrailer: () -> Unit,
+    onPlayEpisode: (EpisodeItem) -> Unit
+) {
+    BackHandler { onBack() }
+    val context = LocalContext.current
+    var selectedSeason by remember { mutableStateOf<Int?>(null) }
+    val seasons = remember(episodes) { episodes.map { it.season }.distinct().sorted() }
+
+    LaunchedEffect(seasons) {
+        if (selectedSeason == null && seasons.isNotEmpty()) {
+            selectedSeason = seasons.first()
+        }
+    }
+
+    val previewPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            volume = 0.6f
+        }
+    }
+
+    LaunchedEffect(episodes.firstOrNull()?.streamUrl) {
+        val firstUrl = episodes.firstOrNull()?.streamUrl
+        if (!firstUrl.isNullOrBlank()) {
+            previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(firstUrl)))
+            previewPlayer.prepare()
+            previewPlayer.seekTo(180_000L)
+            previewPlayer.playWhenReady = true
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { previewPlayer.release() }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0B0E14))
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
+                    player = previewPlayer
+                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                }
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.horizontalGradient(
+                        0.00f to Color(0xFF0B0E14),
+                        0.30f to Color(0xFF0B0E14),
+                        0.55f to Color(0xCC0B0E14),
+                        0.80f to Color(0x440B0E14),
+                        1.00f to Color.Transparent
+                    )
+                )
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        0.00f to Color(0x660B0E14),
+                        0.25f to Color.Transparent,
+                        0.50f to Color(0x440B0E14),
+                        0.70f to Color(0xDD0B0E14),
+                        0.85f to Color(0xFF0B0E14),
+                        1.00f to Color(0xFF0B0E14)
+                    )
+                )
+        )
 
         Column(
             modifier = Modifier
@@ -1939,6 +2277,7 @@ fun HomeDashboard(
         }
     }
 }
+
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun UltimateVideoPlayerScreen(
@@ -2684,7 +3023,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/6.2 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3072,7 +3411,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/6.2 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/6.1 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
