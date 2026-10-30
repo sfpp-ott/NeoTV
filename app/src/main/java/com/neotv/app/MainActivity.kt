@@ -1161,9 +1161,6 @@ fun ParentalPinPromptDialog(
     )
 }
 
-// =========================================================================
-// 1. GUIDE TV HORIZONTAL AVEC CORRECTIF ANTI-ÉCRAN VERT AU ZAPPING
-// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
@@ -1215,7 +1212,6 @@ fun TvGuideScreen(
     }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
-    // Mini-player sécurisé avec repli de décodeur et nettoyage entre 2 chaînes (Zéro écran vert !)
     val miniPlayer = remember {
         buildSafeExoPlayer(context).apply { volume = 1f }
     }
@@ -1223,7 +1219,6 @@ fun TvGuideScreen(
     LaunchedEffect(previewChannel?.id) {
         val url = previewChannel?.streamUrl
         if (!url.isNullOrBlank()) {
-            // Attend 350ms quand on défile dans la liste pour ne pas saturer le décodeur vidéo !
             delay(350L)
             miniPlayer.stop()
             miniPlayer.clearMediaItems()
@@ -1787,11 +1782,9 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
-// =========================================================================
-// 2. FICHE FILM & FICHE SÉRIE AVEC BOUTONS ULTRA-VISIBLES À LA TÉLÉCOMMANDE FIRE STICK !
-// =========================================================================
+// BOUTON UNIFIÉ AVEC ESPACE CORRIGÉ POUR LA TÉLÉCOMMANDE FIRE STICK
 @Composable
-funTvActionButton(
+fun TvActionButton(
     text: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     baseBgColor: Color,
@@ -2016,13 +2009,12 @@ fun MovieDetailScreen(
                 }
             }
 
-            // BOUTONS LECTURE / REPRENDRE / BANDE-ANNONCE AVEC FOCUS BLEU ULTRA-VISIBLE SUR FIRE STICK !
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    funTvActionButton(
+                    TvActionButton(
                         text = if (savedPositionMs > 10000L) "Depuis le début" else "Lecture",
                         icon = Icons.Default.PlayArrow,
                         baseBgColor = Color.White,
@@ -2036,7 +2028,7 @@ fun MovieDetailScreen(
 
                     if (savedPositionMs > 10000L) {
                         val min = (savedPositionMs / 60000).toInt()
-                        funTvActionButton(
+                        TvActionButton(
                             text = "Reprendre (${min}m)",
                             icon = Icons.Default.PlayArrow,
                             baseBgColor = Color(0xFF8B5CF6),
@@ -2048,7 +2040,7 @@ fun MovieDetailScreen(
                         )
                     }
 
-                    funTvActionButton(
+                    TvActionButton(
                         text = "Bande-annonce",
                         icon = Icons.Default.Movie,
                         baseBgColor = Color(0xFFDC2626),
@@ -2221,7 +2213,7 @@ fun SeriesDetailScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     val resumeEp = episodes.firstOrNull { it.id == lastPlayedEpId }
                     if (resumeEp != null) {
-                        funTvActionButton(
+                        TvActionButton(
                             text = "Reprendre S${resumeEp.season}",
                             icon = Icons.Default.PlayArrow,
                             baseBgColor = Color(0xFF8B5CF6),
@@ -2233,7 +2225,7 @@ fun SeriesDetailScreen(
                         )
                     }
 
-                    funTvActionButton(
+                    TvActionButton(
                         text = "Bande-annonce",
                         icon = Icons.Default.Movie,
                         baseBgColor = Color(0xFFDC2626),
@@ -2395,14 +2387,14 @@ fun HomeDashboard(
                             )
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            funTvActionButton(
+                            TvActionButton(
                                 text = "TV en direct",
                                 icon = Icons.Default.LiveTv,
                                 baseBgColor = Color(0xFF8B5CF6),
                                 baseContentColor = Color.White,
                                 onClick = { onSelectTab(1) }
                             )
-                            funTvActionButton(
+                            TvActionButton(
                                 text = "Regarder",
                                 icon = Icons.Default.PlayArrow,
                                 baseBgColor = Color.White,
