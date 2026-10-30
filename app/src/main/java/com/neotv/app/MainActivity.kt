@@ -9,6 +9,7 @@ import android.util.JsonReader
 import android.util.JsonToken
 import android.view.KeyEvent
 import android.view.LayoutInflater
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -40,6 +41,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -60,6 +63,7 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
@@ -78,7 +82,6 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
-import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -94,6 +97,9 @@ val DEFAULT_PROVIDER_URLS = listOf(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // EMPÊCHE TOTALEMENT LA MISE EN VEILLE SUR TÉLÉPHONE ET FIRE STICK !
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->
@@ -116,6 +122,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Créateur d'ExoPlayer avec repli automatique de décodeur (évite l'écran vert H.264/HEVC au zapping !)
+@androidx.annotation.OptIn(UnstableApi::class)
+fun buildSafeExoPlayer(context: Context): ExoPlayer {
+    val renderersFactory = DefaultRenderersFactory(context)
+        .setEnableDecoderFallback(true)
+    return ExoPlayer.Builder(context, renderersFactory).build()
+}
+
 fun Modifier.tvFocusableClick(
     shape: RoundedCornerShape = RoundedCornerShape(8.dp),
     defaultBorderWidth: Dp = 1.dp,
@@ -128,7 +142,7 @@ fun Modifier.tvFocusableClick(
     this
         .clip(shape)
         .border(
-            width = if (isFocused) 2.dp else defaultBorderWidth,
+            width = if (isFocused) 3.dp else defaultBorderWidth,
             color = if (isFocused) Color(0xFF38BDF8) else defaultBorderColor,
             shape = shape
         )
@@ -141,7 +155,6 @@ fun Modifier.tvFocusableClick(
         .clickable { onClick() }
 }
 
-// Modificateur spécial Guide TV style TiviMate : Case blanche pleine + Texte noir quand sélectionné !
 fun Modifier.tiviGuideCellFocus(
     isCurrentBroadcast: Boolean,
     onFocused: () -> Unit,
@@ -268,8 +281,9 @@ fun NeoTvApp() {
     var username by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var password by remember { mutableStateOf(prefs.getString("pass", "") ?: "") }
 
+    // Contrôle parental TOUJOURS activé (sans bouton de désactivation) !
     var parentalPin by remember { mutableStateOf(prefs.getString("parental_pin", "0000") ?: "0000") }
-    var parentalEnabled by remember { mutableStateOf(prefs.getBoolean("parental_enabled", true)) }
+    val parentalEnabled = true
     var pendingPinAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     var accountInfo by remember { mutableStateOf(AccountInfo()) }
@@ -301,7 +315,7 @@ fun NeoTvApp() {
     var statusText by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    var selectedTab by rememberSaveable { mutableStateOf(1) } // Onglet TV en direct par défaut
+    var selectedTab by rememberSaveable { mutableStateOf(1) }
     var selectedCatId by rememberSaveable { mutableStateOf("ALL") }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
@@ -388,7 +402,6 @@ fun NeoTvApp() {
                 liveCategories = liveRes.first
                 liveChannels = liveRes.second
 
-                // LANCEMENT DIRECT SUR LA DERNIÈRE CHAÎNE TV REGARDÉE À L'ALLUMAGE (Comme sur la vidéo !)
                 if (!hasAutoLaunchedLive && liveChannels.isNotEmpty()) {
                     hasAutoLaunchedLive = true
                     val lastId = prefs.getString("last_live_channel_id", "") ?: ""
@@ -402,19 +415,20 @@ fun NeoTvApp() {
                 }
                 System.gc()
 
-                statusText = "Synchronisation Films (triés par ajout récent)..."
+                statusText = "Synchronisation Films..."
                 val vodRes = fetchXtreamVodStreaming(context, serverUrl, username, password, forceRefresh)
                 vodCategories = vodRes.first
                 vodMovies = vodRes.second
                 System.gc()
 
-                statusText = "Synchronisation Séries (triées par ajout récent)..."
+                statusText = "Synchronisation Séries..."
                 val serRes = fetchXtreamSeriesStreaming(context, serverUrl, username, password, forceRefresh)
                 seriesCategories = serRes.first
                 seriesList = serRes.second
                 System.gc()
-            } catch (e: Throwable) {
-                errorMsg = "Erreur de chargement : vérifiez vos identifiants (${e.localizedMessage})"
+            } catch (_: Throwable) {
+                // AUCUNE URL N'EST AFFICHÉE EN CAS D'ERREUR !
+                errorMsg = "Erreur de chargement : vérifiez votre connexion ou vos identifiants."
             } finally {
                 isLoading = false
                 statusText = ""
@@ -469,7 +483,6 @@ fun NeoTvApp() {
                 } else emptyList(),
                 recentLiveChannels = recentChannels,
                 onOpenGuide = {
-                    // Retour direct au Guide TV avec la chaîne actuelle en cours dans le mini-lecteur !
                     selectedTab = 1
                     customStreamOverride = null
                     activeReplayProgram = null
@@ -589,13 +602,11 @@ fun NeoTvApp() {
                 initialUser = username,
                 initialPass = password,
                 accountInfo = accountInfo,
-                parentalEnabled = parentalEnabled,
                 currentPin = parentalPin,
-                onUpdateParental = { enabled, newPin ->
-                    parentalEnabled = enabled
+                onUpdatePin = { newPin ->
                     parentalPin = newPin
                     prefs.edit()
-                        .putBoolean("parental_enabled", enabled)
+                        .putBoolean("parental_enabled", true)
                         .putString("parental_pin", newPin)
                         .apply()
                 },
@@ -1151,7 +1162,7 @@ fun ParentalPinPromptDialog(
 }
 
 // =========================================================================
-// 1. GUIDE TV HORIZONTAL IDENTIQUE À LA VIDÉO (LIGNE BLEUE D'HEURE ACTUELLE + FOCUS BLANC SUR LES PROGRAMMES)
+// 1. GUIDE TV HORIZONTAL AVEC CORRECTIF ANTI-ÉCRAN VERT AU ZAPPING
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1176,8 +1187,6 @@ fun TvGuideScreen(
     var groupUpdateTick by remember { mutableStateOf(0) }
     var showCreateGroupDialog by remember { mutableStateOf(false) }
     var channelToAssignGroup by remember { mutableStateOf<MediaEntry?>(null) }
-
-    // Panneau des catégories repliable à gauche (s'affiche ou se masque facilement comme sur la vidéo)
     var showCategoriesSidebar by remember { mutableStateOf(true) }
 
     fun addOrRemoveChannelInGroup(groupName: String, channelId: String) {
@@ -1206,13 +1215,18 @@ fun TvGuideScreen(
     }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
+    // Mini-player sécurisé avec repli de décodeur et nettoyage entre 2 chaînes (Zéro écran vert !)
     val miniPlayer = remember {
-        ExoPlayer.Builder(context).build().apply { volume = 1f }
+        buildSafeExoPlayer(context).apply { volume = 1f }
     }
 
-    LaunchedEffect(previewChannel?.streamUrl) {
+    LaunchedEffect(previewChannel?.id) {
         val url = previewChannel?.streamUrl
         if (!url.isNullOrBlank()) {
+            // Attend 350ms quand on défile dans la liste pour ne pas saturer le décodeur vidéo !
+            delay(350L)
+            miniPlayer.stop()
+            miniPlayer.clearMediaItems()
             miniPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
             miniPlayer.prepare()
             miniPlayer.playWhenReady = true
@@ -1220,7 +1234,10 @@ fun TvGuideScreen(
     }
 
     DisposableEffect(Unit) {
-        onDispose { miniPlayer.release() }
+        onDispose {
+            miniPlayer.stop()
+            miniPlayer.release()
+        }
     }
 
     if (showCreateGroupDialog) {
@@ -1323,7 +1340,6 @@ fun TvGuideScreen(
         )
     }
 
-    // HORLOGE EN TEMPS RÉEL (Rafraîchie toutes les 20s pour faire avancer la ligne bleue)
     var nowSec by remember { mutableStateOf(System.currentTimeMillis() / 1000L) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -1335,12 +1351,10 @@ fun TvGuideScreen(
     val timelineStartSec = remember { (nowSec / 1800L) * 1800L }
     val timelineEndSec = remember { timelineStartSec + 6 * 3600L }
 
-    // Échelle : 1 minute = 4.5.dp -> 30 minutes = 135.dp
     val dpPerMinute = 4.5f
     val slotWidthDp = (30 * dpPerMinute).dp
     val channelColumnWidth = 235.dp
 
-    // Calcul exact de la position de la ligne verticale bleue (avec le rond en haut)
     val currentTimeOffsetDp = (((nowSec - timelineStartSec).coerceAtLeast(0L) / 60f) * dpPerMinute).dp
 
     val timeSlots = remember(timelineStartSec) {
@@ -1357,7 +1371,6 @@ fun TvGuideScreen(
     val horizontalScrollState = rememberScrollState()
 
     Row(modifier = Modifier.fillMaxSize().padding(top = 2.dp)) {
-        // COLONNE GAUCHE : CATÉGORIES (Favoris, Toutes les chaînes, FRANCE HD | TV, etc.)
         if (showCategoriesSidebar) {
             LazyColumn(
                 modifier = Modifier
@@ -1390,7 +1403,6 @@ fun TvGuideScreen(
         }
 
         Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-            // PARTIE HAUTE : APERÇU VIDÉO À GAUCHE + DÉTAILS DU PROGRAMME SURVOLÉ À DROITE (Exactement comme la vidéo !)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1399,7 +1411,6 @@ fun TvGuideScreen(
                     .padding(horizontal = 6.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // Mini-écran vidéo (Cliquer dessus = Plein Écran)
                 Box(
                     modifier = Modifier
                         .width(235.dp)
@@ -1413,6 +1424,7 @@ fun TvGuideScreen(
                         factory = { ctx ->
                             (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                                 player = miniPlayer
+                                useController = false
                                 resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                             }
                         },
@@ -1420,7 +1432,6 @@ fun TvGuideScreen(
                     )
                 }
 
-                // Informations synchronisées avec la case blanche sélectionnée dans la grille
                 val currentChannelProgs = previewChannel?.let { epgCache[it.id] } ?: emptyList()
                 val activeProg = highlightedProgram
                     ?: currentChannelProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
@@ -1444,7 +1455,6 @@ fun TvGuideScreen(
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
-                        // Nom de la catégorie tout à droite (ex: FRANCE HD | TV) comme sur la vidéo
                         Text(
                             text = previewChannel?.categoryName ?: "",
                             color = Color(0xFF94A3B8),
@@ -1503,7 +1513,6 @@ fun TvGuideScreen(
                 }
             }
 
-            // BARRE DES HORAIRES (ven. 30 oct., 13:43 | 13:30 | 14:00 | 14:30 | 15:00...)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1535,7 +1544,6 @@ fun TvGuideScreen(
                 }
             }
 
-            // GRILLE DES CHAÎNES + CASES DE PROGRAMMES + LIGNE VERTICALE BLEUE DE L'HEURE ACTUELLE
             Box(modifier = Modifier.fillMaxSize()) {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
@@ -1557,7 +1565,6 @@ fun TvGuideScreen(
                                 .background(Color(0xFF0E131B)),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // COLONNE CHAÎNE (Numéro + Logo + Titre + Flèche bleue si en cours + Horloge Replay)
                             Row(
                                 modifier = Modifier
                                     .width(channelColumnWidth)
@@ -1581,7 +1588,6 @@ fun TvGuideScreen(
                                     .padding(horizontal = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // Étoile Favori / Groupe
                                 Icon(
                                     imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
                                     contentDescription = "Favori",
@@ -1634,7 +1640,6 @@ fun TvGuideScreen(
                                 }
                             }
 
-                            // CASES DES PROGRAMMES SUR LESQUELLES ON NAVIGUE DE HAUT EN BAS (CASE BLANCHE QUAND SÉLECTIONNÉ !)
                             Row(
                                 modifier = Modifier
                                     .horizontalScroll(horizontalScrollState)
@@ -1724,7 +1729,6 @@ fun TvGuideScreen(
                     }
                 }
 
-                // LIGNE VERTICALE BLEUE DE L'HEURE ACTUELLE AVEC POINT ROND EN HAUT (Comme à 1:50 dans votre vidéo !)
                 if (horizontalScrollState.value == 0) {
                     val lineX = channelColumnWidth + currentTimeOffsetDp
                     Column(
@@ -1784,8 +1788,50 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM & FICHE SÉRIE (TRIÉES PAR ORDRE D'AJOUT DU SERVEUR)
+// 2. FICHE FILM & FICHE SÉRIE AVEC BOUTONS ULTRA-VISIBLES À LA TÉLÉCOMMANDE FIRE STICK !
 // =========================================================================
+@Composable
+funTvActionButton(
+    text: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    baseBgColor: Color,
+    baseContentColor: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .border(
+                width = if (isFocused) 3.dp else 1.dp,
+                color = if (isFocused) Color(0xFF38BDF8) else Color(0x44FFFFFF),
+                shape = RoundedCornerShape(10.dp)
+            )
+            .background(if (isFocused) Color(0xFF38BDF8) else baseBgColor)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+            .padding(horizontal = 18.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = if (isFocused) Color.Black else baseContentColor,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+            text = text,
+            color = if (isFocused) Color.Black else baseContentColor,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
+    }
+}
+
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun MovieDetailScreen(
@@ -1803,9 +1849,10 @@ fun MovieDetailScreen(
     BackHandler { onBack() }
     val context = LocalContext.current
     var isMuted by remember { mutableStateOf(false) }
+    val playButtonFocusRequester = remember { FocusRequester() }
 
     val previewPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
+        buildSafeExoPlayer(context).apply {
             setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
             prepare()
             seekTo(480_000L)
@@ -1814,8 +1861,16 @@ fun MovieDetailScreen(
         }
     }
 
+    LaunchedEffect(Unit) {
+        delay(150L)
+        runCatching { playButtonFocusRequester.requestFocus() }
+    }
+
     DisposableEffect(Unit) {
-        onDispose { previewPlayer.release() }
+        onDispose {
+            previewPlayer.stop()
+            previewPlayer.release()
+        }
     }
 
     Box(
@@ -1827,6 +1882,7 @@ fun MovieDetailScreen(
             factory = { ctx ->
                 (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                     player = previewPlayer
+                    useController = false
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                 }
             },
@@ -1874,20 +1930,26 @@ fun MovieDetailScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = onBack,
-                        modifier = Modifier.clip(CircleShape).background(Color(0x88151A24))
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .tvFocusableClick(CircleShape, onClick = onBack)
+                            .background(Color(0xAA151A24)),
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        IconButton(
-                            onClick = {
-                                isMuted = !isMuted
-                                previewPlayer.volume = if (isMuted) 0f else 1f
-                            },
-                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .tvFocusableClick(CircleShape, onClick = {
+                                    isMuted = !isMuted
+                                    previewPlayer.volume = if (isMuted) 0f else 1f
+                                })
+                                .background(Color(0xAA151A24)),
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
@@ -1896,9 +1958,12 @@ fun MovieDetailScreen(
                             )
                         }
 
-                        IconButton(
-                            onClick = onToggleFav,
-                            modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                        Box(
+                            modifier = Modifier
+                                .size(42.dp)
+                                .tvFocusableClick(CircleShape, onClick = onToggleFav)
+                                .background(Color(0xAA151A24)),
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
@@ -1951,52 +2016,48 @@ fun MovieDetailScreen(
                 }
             }
 
+            // BOUTONS LECTURE / REPRENDRE / BANDE-ANNONCE AVEC FOCUS BLEU ULTRA-VISIBLE SUR FIRE STICK !
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Button(
+                    funTvActionButton(
+                        text = if (savedPositionMs > 10000L) "Depuis le début" else "Lecture",
+                        icon = Icons.Default.PlayArrow,
+                        baseBgColor = Color.White,
+                        baseContentColor = Color.Black,
+                        modifier = Modifier.focusRequester(playButtonFocusRequester),
                         onClick = {
                             previewPlayer.pause()
                             onPlayFromStart()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(if (savedPositionMs > 10000L) "Depuis le début" else "Lecture", color = Color.Black, fontWeight = FontWeight.ExtraBold)
-                    }
+                        }
+                    )
 
                     if (savedPositionMs > 10000L) {
                         val min = (savedPositionMs / 60000).toInt()
-                        Button(
+                        funTvActionButton(
+                            text = "Reprendre (${min}m)",
+                            icon = Icons.Default.PlayArrow,
+                            baseBgColor = Color(0xFF8B5CF6),
+                            baseContentColor = Color.White,
                             onClick = {
                                 previewPlayer.pause()
                                 onResumePlay()
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reprendre (${min}m)", color = Color.White, fontWeight = FontWeight.Bold)
-                        }
+                            }
+                        )
                     }
 
-                    Button(
+                    funTvActionButton(
+                        text = "Bande-annonce",
+                        icon = Icons.Default.Movie,
+                        baseBgColor = Color(0xFFDC2626),
+                        baseContentColor = Color.White,
                         onClick = {
                             previewPlayer.pause()
                             onWatchTrailer()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
+                        }
+                    )
                 }
             }
 
@@ -2059,7 +2120,7 @@ fun SeriesDetailScreen(
     }
 
     val previewPlayer = remember {
-        ExoPlayer.Builder(context).build().apply {
+        buildSafeExoPlayer(context).apply {
             volume = 0.6f
         }
     }
@@ -2067,6 +2128,8 @@ fun SeriesDetailScreen(
     LaunchedEffect(episodes.firstOrNull()?.streamUrl) {
         val firstUrl = episodes.firstOrNull()?.streamUrl
         if (!firstUrl.isNullOrBlank()) {
+            previewPlayer.stop()
+            previewPlayer.clearMediaItems()
             previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(firstUrl)))
             previewPlayer.prepare()
             previewPlayer.seekTo(180_000L)
@@ -2075,7 +2138,10 @@ fun SeriesDetailScreen(
     }
 
     DisposableEffect(Unit) {
-        onDispose { previewPlayer.release() }
+        onDispose {
+            previewPlayer.stop()
+            previewPlayer.release()
+        }
     }
 
     Box(
@@ -2087,6 +2153,7 @@ fun SeriesDetailScreen(
             factory = { ctx ->
                 (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
                     player = previewPlayer
+                    useController = false
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                 }
             },
@@ -2133,9 +2200,16 @@ fun SeriesDetailScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                    IconButton(onClick = onBack) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .tvFocusableClick(CircleShape, onClick = onBack)
+                            .background(Color(0xAA151A24)),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                     }
+                    Spacer(modifier = Modifier.width(12.dp))
                     Column {
                         Text(series.title, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.ExtraBold)
                         if (plot.isNotBlank()) {
@@ -2144,39 +2218,38 @@ fun SeriesDetailScreen(
                     }
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     val resumeEp = episodes.firstOrNull { it.id == lastPlayedEpId }
                     if (resumeEp != null) {
-                        Button(
+                        funTvActionButton(
+                            text = "Reprendre S${resumeEp.season}",
+                            icon = Icons.Default.PlayArrow,
+                            baseBgColor = Color(0xFF8B5CF6),
+                            baseContentColor = Color.White,
                             onClick = {
                                 previewPlayer.pause()
                                 onPlayEpisode(resumeEp)
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                            shape = RoundedCornerShape(10.dp)
-                        ) {
-                            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.White)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Reprendre S${resumeEp.season}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                        }
+                            }
+                        )
                     }
 
-                    Button(
+                    funTvActionButton(
+                        text = "Bande-annonce",
+                        icon = Icons.Default.Movie,
+                        baseBgColor = Color(0xFFDC2626),
+                        baseContentColor = Color.White,
                         onClick = {
                             previewPlayer.pause()
                             onWatchTrailer()
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(Icons.Default.Movie, contentDescription = null, tint = Color.White)
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Bande-annonce", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    }
+                        }
+                    )
 
-                    IconButton(
-                        onClick = onToggleFav,
-                        modifier = Modifier.clip(CircleShape).background(Color(0xAA151A24))
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .tvFocusableClick(CircleShape, onClick = onToggleFav)
+                            .background(Color(0xAA151A24)),
+                        contentAlignment = Alignment.Center
                     ) {
                         Icon(
                             imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
@@ -2321,25 +2394,21 @@ fun HomeDashboard(
                                 fontSize = 12.sp
                             )
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Button(
-                                onClick = { onSelectTab(1) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                                shape = RoundedCornerShape(10.dp)
-                            ) {
-                                Icon(Icons.Default.LiveTv, contentDescription = null, tint = Color.White)
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("TV en direct", color = Color.White, fontWeight = FontWeight.Bold)
-                            }
-                            Button(
-                                onClick = { if (featured != null) onSelectMedia(featured) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                                shape = RoundedCornerShape(10.dp)
-                            ) {
-                                Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Regarder", color = Color.Black, fontWeight = FontWeight.Bold)
-                            }
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            funTvActionButton(
+                                text = "TV en direct",
+                                icon = Icons.Default.LiveTv,
+                                baseBgColor = Color(0xFF8B5CF6),
+                                baseContentColor = Color.White,
+                                onClick = { onSelectTab(1) }
+                            )
+                            funTvActionButton(
+                                text = "Regarder",
+                                icon = Icons.Default.PlayArrow,
+                                baseBgColor = Color.White,
+                                baseContentColor = Color.Black,
+                                onClick = { if (featured != null) onSelectMedia(featured) }
+                            )
                         }
                     }
                 }
@@ -2433,7 +2502,7 @@ fun HomeDashboard(
     }
 }
 // =========================================================================
-// 3. LECTEUR VIDÉO PLEIN ÉCRAN STYLE TIVIMATE (SANS ICÔNES PARASITES + OSD AU CLIC OK + TIMESHIFT + REPLAY MULTI-JOURS À GAUCHE)
+// 3. LECTEUR VIDÉO PLEIN ÉCRAN STYLE TIVIMATE (ANTI-ÉCRAN VERT + OSD AU CLIC OK + TIMESHIFT + REPLAY MULTI-JOURS À GAUCHE)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -2460,12 +2529,10 @@ fun UltimateVideoPlayerScreen(
 ) {
     val context = LocalContext.current
 
-    // Affiche le bandeau OSD d'information 4 secondes au lancement d'une chaîne puis disparaît (plein écran 100% propre)
     var osdVisible by remember { mutableStateOf(true) }
-    var seekBarMode by remember { mutableStateOf(false) } // Activé avec la flèche Haut quand l'OSD est ouvert !
+    var seekBarMode by remember { mutableStateOf(false) }
     var interactionTick by remember { mutableStateOf(0) }
 
-    // Tiroir Replay à 3 colonnes (Chaînes | Programmes + Sélecteur de Jour | Résumé) quand on appuie à Gauche
     var showLeftReplayDrawer by remember { mutableStateOf(false) }
     var showTracksDialog by remember { mutableStateOf(false) }
 
@@ -2476,13 +2543,12 @@ fun UltimateVideoPlayerScreen(
         AspectRatioFrameLayout.RESIZE_MODE_FILL to "Étiré 16:9"
     )
 
-    // Gestion du recul sur le direct (Timeshift minute par minute comme sur la vidéo)
     var liveTimeshiftOffsetSec by remember(media.id, streamUrlToPlay) { mutableStateOf(0L) }
     var activeUrl by remember(streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
     var isPausedState by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
-        ExoPlayer.Builder(context).build()
+        buildSafeExoPlayer(context)
     }
 
     LaunchedEffect(osdVisible, interactionTick, showLeftReplayDrawer, showTracksDialog) {
@@ -2499,6 +2565,8 @@ fun UltimateVideoPlayerScreen(
     }
 
     LaunchedEffect(activeUrl) {
+        exoPlayer.stop()
+        exoPlayer.clearMediaItems()
         exoPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(activeUrl)))
         exoPlayer.prepare()
         if (startPositionMs > 0L && media.type != "LIVE") {
@@ -2528,6 +2596,7 @@ fun UltimateVideoPlayerScreen(
             if (media.type != "LIVE") {
                 onSaveProgress(exoPlayer.currentPosition, exoPlayer.duration)
             }
+            exoPlayer.stop()
             exoPlayer.release()
         }
     }
@@ -2538,7 +2607,7 @@ fun UltimateVideoPlayerScreen(
             showLeftReplayDrawer -> showLeftReplayDrawer = false
             seekBarMode -> seekBarMode = false
             osdVisible -> osdVisible = false
-            media.type == "LIVE" -> onOpenGuide() // Retour sur une chaîne TV = retourne au Guide TV avec l'aperçu !
+            media.type == "LIVE" -> onOpenGuide()
             else -> onBack()
         }
     }
@@ -2552,7 +2621,6 @@ fun UltimateVideoPlayerScreen(
         else epgList.firstOrNull { it.startTimestamp >= currentEpg.stopTimestamp }
     }
 
-    // Fonction pour reculer ou avancer dans l'émission en direct (Timeshift) ou dans un Replay/Film
     fun jumpBySeconds(deltaSec: Long) {
         wakeUpOsd()
         if (media.type != "LIVE" || isReplayMode || exoPlayer.isCurrentMediaItemSeekable) {
@@ -2593,17 +2661,16 @@ fun UltimateVideoPlayerScreen(
                         }
                         KeyEvent.KEYCODE_DPAD_LEFT -> {
                             if (!osdVisible && !showLeftReplayDrawer && media.type == "LIVE") {
-                                // Appui à gauche en plein écran = Ouvre le panneau Chaînes + Replay par jour !
                                 showLeftReplayDrawer = true
                                 true
                             } else if (seekBarMode) {
-                                jumpBySeconds(-60L) // Recule d'1 minute sur la barre de progression !
+                                jumpBySeconds(-60L)
                                 true
                             } else false
                         }
                         KeyEvent.KEYCODE_DPAD_RIGHT -> {
                             if (seekBarMode) {
-                                jumpBySeconds(60L) // Avance d'1 minute sur la barre de progression !
+                                jumpBySeconds(60L)
                                 true
                             } else false
                         }
@@ -2640,12 +2707,11 @@ fun UltimateVideoPlayerScreen(
                 }
             }
     ) {
-        // 1. LECTEUR PLEIN ÉCRAN SANS AUCUN CONTRÔLEUR PARASITE (useController = false)
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     player = exoPlayer
-                    useController = false // ZÉRO ICÔNE PARASITE À L'ALLUMAGE !
+                    useController = false
                     resizeMode = resizeModes[resizeModeIndex].first
                 }
             },
@@ -2655,9 +2721,7 @@ fun UltimateVideoPlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. BANDEAU D'INFORMATION TIVIMATE (EN HAUT ET EN BAS QUAND ON APPUIE SUR OK)
         if (osdVisible && !showLeftReplayDrawer) {
-            // En-tête discret en haut : Catégorie à gauche | Date & Heure à droite (comme à 3:38 dans la vidéo)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2685,7 +2749,6 @@ fun UltimateVideoPlayerScreen(
                 )
             }
 
-            // Bandeau complet en bas style TiviMate
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -2701,7 +2764,6 @@ fun UltimateVideoPlayerScreen(
                     .padding(horizontal = 26.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // Ligne principale : Grand Logo Chaîne + Titre Émission + Horaires + Badges FHD / 50 FPS / STEREO
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(18.dp),
@@ -2773,7 +2835,6 @@ fun UltimateVideoPlayerScreen(
                                 fontWeight = FontWeight.Bold
                             )
 
-                            // Badges techniques FHD | 50 FPS | STEREO comme sur la vidéo
                             TechBadge("FHD")
                             TechBadge("50 FPS")
                             TechBadge("STEREO")
@@ -2791,7 +2852,6 @@ fun UltimateVideoPlayerScreen(
                     }
                 }
 
-                // BARRE DE PROGRESSION TIMESHIFT / REPLAY AVEC CONTRÔLES (S'ouvre avec Flèche Haut comme à 3:42 !)
                 val progDurationSec = if (currentEpg != null) {
                     (currentEpg.stopTimestamp - currentEpg.startTimestamp).coerceAtLeast(60L)
                 } else {
@@ -2812,7 +2872,6 @@ fun UltimateVideoPlayerScreen(
                 } else ""
 
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    // Ligne de progression bleue avec curseur rond blanc/bleu
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2839,7 +2898,6 @@ fun UltimateVideoPlayerScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // Temps écoulé : ex "45:26 / 50:00 [-01:00]" (Exactement comme à 3:59 !)
                             Text(
                                 text = "$elapsedMinStr / $totalMinStr$offsetMinStr",
                                 color = Color.White,
@@ -2847,7 +2905,6 @@ fun UltimateVideoPlayerScreen(
                                 fontWeight = FontWeight.Bold
                             )
 
-                            // Boutons centraux : Début | -5 min | -1 min | Play/Pause | +1 min | +5 min
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -2863,11 +2920,10 @@ fun UltimateVideoPlayerScreen(
                                 PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
                                 PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
 
-                                // Bouton central Pause / Lecture
                                 Box(
                                     modifier = Modifier
                                         .size(40.dp)
-                                        .tvFocusableClick(CircleShape, focusedBgColor = Color.White, onClick = {
+                                        .tvFocusableClick(CircleShape, focusedBgColor = Color(0xFF38BDF8), onClick = {
                                             wakeUpOsd()
                                             if (exoPlayer.isPlaying) {
                                                 exoPlayer.pause()
@@ -2891,7 +2947,6 @@ fun UltimateVideoPlayerScreen(
                                 PlayerCircleButton("5m ⏩", "+5 min") { jumpBySeconds(300L) }
                             }
 
-                            // Boutons de droite : Format image | Audio/ST | Bouton "Direct" (comme à 4:38 !)
                             Row(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -2929,7 +2984,6 @@ fun UltimateVideoPlayerScreen(
                     }
                 }
 
-                // RANGÉE DU BAS : Guide TV | Historique (Replay) | Cartes des chaînes récentes (TF1, Canal+, BFM, M6...)
                 if (media.type == "LIVE") {
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -2987,7 +3041,6 @@ fun UltimateVideoPlayerScreen(
             }
         }
 
-        // 3. PANNEAU REPLAY & EPG MULTI-JOURS À GAUCHE (Comme à 5:12 - 6:00 dans votre vidéo !)
         if (showLeftReplayDrawer && liveChannelList.isNotEmpty()) {
             TiviMateLeftReplayOverlay(
                 channels = liveChannelList,
@@ -3013,9 +3066,6 @@ fun UltimateVideoPlayerScreen(
     }
 }
 
-// =========================================================================
-// PANNEAU TRANSPARENT 3 COLONNES (CHAÎNES | PROGRAMMES + CHOIX DU JOUR | RÉSUMÉ) COMME À 5:35 DANS LA VIDÉO
-// =========================================================================
 @Composable
 fun TiviMateLeftReplayOverlay(
     channels: List<MediaEntry>,
@@ -3033,7 +3083,6 @@ fun TiviMateLeftReplayOverlay(
     val channelPrograms = epgCache[selectedChannel.id] ?: emptyList()
     val nowSec = System.currentTimeMillis() / 1000L
 
-    // Liste des jours disponibles (ex: sam. 24 oct., dim. 25 oct., lun. 26 oct. ... ven. 30 oct.)
     val availableDays = remember(channelPrograms) {
         val pairs = channelPrograms.map { it.dayKey to it.dayLabel }.distinctBy { it.first }
         if (pairs.isEmpty()) {
@@ -3070,7 +3119,6 @@ fun TiviMateLeftReplayOverlay(
             .padding(16.dp),
         horizontalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // COLONNE 1 : LISTE DES CHAÎNES À GAUCHE
         LazyColumn(
             modifier = Modifier
                 .width(225.dp)
@@ -3116,7 +3164,6 @@ fun TiviMateLeftReplayOverlay(
             }
         }
 
-        // COLONNE 2 : PROGRAMMES DU JOUR CHOISI + COLONNE DES JOURS (lun. 26 oct., mar. 27 oct., ven. 30 oct.)
         Column(
             modifier = Modifier
                 .width(390.dp)
@@ -3140,7 +3187,6 @@ fun TiviMateLeftReplayOverlay(
             Spacer(modifier = Modifier.height(10.dp))
 
             Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                // Liste des émissions du jour avec horaire et icône Replay
                 LazyColumn(
                     modifier = Modifier.weight(1f).fillMaxHeight(),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
@@ -3197,7 +3243,6 @@ fun TiviMateLeftReplayOverlay(
                     }
                 }
 
-                // Sélecteur vertical de Jours (sam. 24 oct., dim. 25 oct., lun. 26 oct. ... ven. 30 oct.) comme à 5:45 !
                 LazyColumn(
                     modifier = Modifier
                         .width(74.dp)
@@ -3233,7 +3278,6 @@ fun TiviMateLeftReplayOverlay(
             }
         }
 
-        // COLONNE 3 : DESCRIPTION DÉTAILLÉE DU PROGRAMME SÉLECTIONNÉ À DROITE
         Column(
             modifier = Modifier
                 .weight(1f)
@@ -3502,7 +3546,7 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 4. ESPACE CLIENT VERROUILLÉ PAR VOTRE PANEL D'URLS + MODE ADMIN SECRET
+// 4. ESPACE CLIENT VERROUILLÉ PAR VOTRE PANEL D'URLS + CONTRÔLE PARENTAL OBLIGATOIRE (SANS BOUTON SWITCH)
 // =========================================================================
 suspend fun resolveAuthorizedServerForUser(user: String, pass: String, fallbackServer: String): String = withContext(Dispatchers.IO) {
     val candidateUrls = mutableListOf<String>()
@@ -3540,9 +3584,8 @@ fun IptvSetupScreen(
     initialUser: String,
     initialPass: String,
     accountInfo: AccountInfo,
-    parentalEnabled: Boolean,
     currentPin: String,
-    onUpdateParental: (Boolean, String) -> Unit,
+    onUpdatePin: (String) -> Unit,
     onSave: (String, String, String) -> Unit,
     onCancel: () -> Unit
 ) {
@@ -3562,7 +3605,7 @@ fun IptvSetupScreen(
         ChangeParentalPinDialog(
             currentPin = currentPin,
             onPinChanged = { newPin ->
-                onUpdateParental(parentalEnabled, newPin)
+                onUpdatePin(newPin)
                 showChangePinDialog = false
                 pinChangeMessage = "Votre code parental a bien été modifié !"
             },
@@ -3670,6 +3713,7 @@ fun IptvSetupScreen(
             }
         }
 
+        // BLOC CONTRÔLE PARENTAL SANS BOUTON D'ACTIVATION/DÉSACTIVATION (TOUJOURS ACTIF !)
         item {
             Column(
                 modifier = Modifier
@@ -3680,36 +3724,23 @@ fun IptvSetupScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("🔒 Contrôle Parental (Contenus Adultes 18+)", color = Color(0xFFA855F7), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        Text("Verrouille les catégories et contenus adultes par mot de passe (par défaut : 0000)", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                    }
-                    Switch(
-                        checked = parentalEnabled,
-                        onCheckedChange = { newState ->
-                            onUpdateParental(newState, currentPin)
-                        }
-                    )
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text("🔒 Contrôle Parental (Contenus Adultes 18+)", color = Color(0xFFA855F7), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text("Verrouille les catégories et contenus adultes par mot de passe (par défaut : 0000)", color = Color(0xFF94A3B8), fontSize = 12.sp)
                 }
 
                 pinChangeMessage?.let {
                     Text(it, color = Color(0xFF4ADE80), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                 }
 
-                Button(
-                    onClick = { showChangePinDialog = true },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF262F40)),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFACC15), modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Modifier le code PIN / Mot de passe parental", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                }
+                TvActionButton(
+                    text = "Modifier le code PIN / Mot de passe parental",
+                    icon = Icons.Default.Lock,
+                    baseBgColor = Color(0xFF262F40),
+                    baseContentColor = Color.White,
+                    onClick = { showChangePinDialog = true }
+                )
             }
         }
     }
@@ -3784,7 +3815,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/8.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.1 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3932,7 +3963,6 @@ suspend fun fetchXtreamLiveStreaming(
     Pair(catMap.values.toList(), list)
 }
 
-// TRI AUTOMATIQUE DES FILMS PAR ORDRE D'AJOUT DU SERVEUR (DU PLUS RÉCENT AU PLUS ANCIEN !)
 suspend fun fetchXtreamVodStreaming(
     context: Context,
     baseUrl: String,
@@ -4005,7 +4035,6 @@ suspend fun fetchXtreamVodStreaming(
     Pair(catMap.values.toList(), list)
 }
 
-// TRI AUTOMATIQUE DES SÉRIES PAR ORDRE D'AJOUT / MODIFICATION DU SERVEUR (DE LA PLUS RÉCENTE À LA PLUS ANCIENNE !)
 suspend fun fetchXtreamSeriesStreaming(
     context: Context,
     baseUrl: String,
@@ -4159,7 +4188,6 @@ suspend fun fetchSeriesEpisodesAndInfo(
     }
 }
 
-// RÉCUPÈRE TOUT L'HISTORIQUE EPG (MULTI-JOURS) POUR LE REPLAY PAR JOUR ET LE GUIDE TV
 suspend fun fetchChannelEpgList(
     baseUrl: String,
     user: String,
@@ -4168,7 +4196,6 @@ suspend fun fetchChannelEpgList(
 ): List<EpgProgram> = withContext(Dispatchers.IO) {
     try {
         val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
-        // get_simple_data_table renvoie tous les jours archivés (Passé + Direct + Futur)
         val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_simple_data_table&stream_id=$streamId")
         val obj = JSONObject(json)
         val arr = obj.optJSONArray("epg_listings") ?: return@withContext emptyList()
@@ -4242,7 +4269,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/8.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.1 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
