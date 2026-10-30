@@ -87,18 +87,19 @@ import java.util.Locale
 import java.util.TimeZone
 
 // =========================================================================
-// CONFIGURATION DU PANEL D'URLS À DISTANCE
+// CONFIGURATION DU PANEL D'URLS À DISTANCE & CODE SECRET ADMIN
 // =========================================================================
 const val REMOTE_PANEL_URLS_JSON = "https://raw.githubusercontent.com/sfpp-ott/NeoTV/main/panel_urls.json"
 val DEFAULT_PROVIDER_URLS = listOf(
     "http://votre-serveur-principal.com:8080"
 )
+// Code secret à taper dans "Nom d'utilisateur" pour débloquer la case URL Serveur :
+const val SECRET_ADMIN_UNLOCK_CODE = "888899"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // EMPÊCHE TOTALEMENT LA MISE EN VEILLE SUR TÉLÉPHONE ET FIRE STICK !
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
@@ -122,7 +123,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// Créateur d'ExoPlayer avec repli automatique de décodeur (évite l'écran vert H.264/HEVC au zapping !)
 @androidx.annotation.OptIn(UnstableApi::class)
 fun buildSafeExoPlayer(context: Context): ExoPlayer {
     val renderersFactory = DefaultRenderersFactory(context)
@@ -281,7 +281,6 @@ fun NeoTvApp() {
     var username by remember { mutableStateOf(prefs.getString("user", "") ?: "") }
     var password by remember { mutableStateOf(prefs.getString("pass", "") ?: "") }
 
-    // Contrôle parental TOUJOURS activé (sans bouton de désactivation) !
     var parentalPin by remember { mutableStateOf(prefs.getString("parental_pin", "0000") ?: "0000") }
     val parentalEnabled = true
     var pendingPinAction by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -427,7 +426,6 @@ fun NeoTvApp() {
                 seriesList = serRes.second
                 System.gc()
             } catch (_: Throwable) {
-                // AUCUNE URL N'EST AFFICHÉE EN CAS D'ERREUR !
                 errorMsg = "Erreur de chargement : vérifiez votre connexion ou vos identifiants."
             } finally {
                 isLoading = false
@@ -1161,6 +1159,9 @@ fun ParentalPinPromptDialog(
     )
 }
 
+// =========================================================================
+// 1. GUIDE TV HORIZONTAL AVEC CRÉATION ET SUPPRESSION DE GROUPES PERSONNALISÉS
+// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
@@ -1183,6 +1184,7 @@ fun TvGuideScreen(
     }
     var groupUpdateTick by remember { mutableStateOf(0) }
     var showCreateGroupDialog by remember { mutableStateOf(false) }
+    var groupToDeleteConfirm by remember { mutableStateOf<String?>(null) }
     var channelToAssignGroup by remember { mutableStateOf<MediaEntry?>(null) }
     var showCategoriesSidebar by remember { mutableStateOf(true) }
 
@@ -1191,6 +1193,19 @@ fun TvGuideScreen(
         val current = prefs.getStringSet(key, emptySet())?.toMutableSet() ?: mutableSetOf()
         if (current.contains(channelId)) current.remove(channelId) else current.add(channelId)
         prefs.edit().putStringSet(key, current).apply()
+        groupUpdateTick++
+    }
+
+    fun deleteCustomGroup(groupName: String) {
+        val next = customGroupNames - groupName
+        customGroupNames = next
+        prefs.edit()
+            .putStringSet("custom_groups", next)
+            .remove("group_members_$groupName")
+            .apply()
+        if (selectedCatId == "CUSTOM_$groupName") {
+            onSelectCategory("ALL", false)
+        }
         groupUpdateTick++
     }
 
@@ -1274,6 +1289,39 @@ fun TvGuideScreen(
         )
     }
 
+    // Fenêtre de confirmation de suppression d'un groupe créé par erreur
+    if (groupToDeleteConfirm != null) {
+        val gName = groupToDeleteConfirm!!
+        AlertDialog(
+            onDismissRequest = { groupToDeleteConfirm = null },
+            containerColor = Color(0xFF151A24),
+            title = { Text("Supprimer ce groupe ?", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    text = "Voulez-vous vraiment supprimer votre groupe personnalisé « $gName » ?",
+                    color = Color(0xFFCBD5E1),
+                    fontSize = 14.sp
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        deleteCustomGroup(gName)
+                        groupToDeleteConfirm = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444))
+                ) {
+                    Text("Oui, supprimer", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { groupToDeleteConfirm = null }) {
+                    Text("Annuler", color = Color.White)
+                }
+            }
+        )
+    }
+
     if (channelToAssignGroup != null) {
         val ch = channelToAssignGroup!!
         AlertDialog(
@@ -1301,20 +1349,39 @@ fun TvGuideScreen(
                         val members = prefs.getStringSet("group_members_$gName", emptySet()) ?: emptySet()
                         val isInGroup = members.contains(ch.id)
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
-                                    addOrRemoveChannelInGroup(gName, ch.id)
-                                    channelToAssignGroup = null
-                                })
-                                .background(if (isInGroup) Color(0xFF38BDF8) else Color(0xFF0B0E14))
-                                .padding(12.dp)
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = if (isInGroup) "📁 Retirer du groupe « $gName »" else "📁 Ajouter au groupe « $gName »",
-                                color = if (isInGroup) Color.Black else Color.White,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                                        addOrRemoveChannelInGroup(gName, ch.id)
+                                        channelToAssignGroup = null
+                                    })
+                                    .background(if (isInGroup) Color(0xFF38BDF8) else Color(0xFF0B0E14))
+                                    .padding(12.dp)
+                            ) {
+                                Text(
+                                    text = if (isInGroup) "📁 Retirer de « $gName »" else "📁 Ajouter à « $gName »",
+                                    color = if (isInGroup) Color.Black else Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                            // Bouton Corbeille pour supprimer ce groupe directement depuis la fenêtre
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                                        channelToAssignGroup = null
+                                        groupToDeleteConfirm = gName
+                                    })
+                                    .background(Color(0xFF261218)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.Delete, contentDescription = "Supprimer groupe", tint = Color(0xFFEF4444))
+                            }
                         }
                     }
                 }
@@ -1369,7 +1436,7 @@ fun TvGuideScreen(
         if (showCategoriesSidebar) {
             LazyColumn(
                 modifier = Modifier
-                    .width(170.dp)
+                    .width(180.dp)
                     .fillMaxHeight()
                     .background(Color(0xFF0E131B))
                     .padding(6.dp),
@@ -1381,9 +1448,36 @@ fun TvGuideScreen(
                 item {
                     CategoryRowItem("Favoris (${favorites.size})", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
                 }
+                // Groupes personnalisés avec bouton Corbeille 🗑️ à droite pour les supprimer en 1 clic !
                 items(customGroupNames.toList()) { gName ->
-                    CategoryRowItem("📁 $gName", selectedCatId == "CUSTOM_$gName") {
-                        onSelectCategory("CUSTOM_$gName", false)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            CategoryRowItem("📁 $gName", selectedCatId == "CUSTOM_$gName") {
+                                onSelectCategory("CUSTOM_$gName", false)
+                            }
+                        }
+                        Box(
+                            modifier = Modifier
+                                .size(30.dp)
+                                .tvFocusableClick(
+                                    RoundedCornerShape(5.dp),
+                                    defaultBorderWidth = 0.dp,
+                                    focusedBgColor = Color(0xFFEF4444),
+                                    onClick = { groupToDeleteConfirm = gName }
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                Icons.Default.Delete,
+                                contentDescription = "Supprimer $gName",
+                                tint = Color(0xFF94A3B8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
                 item {
@@ -1583,15 +1677,24 @@ fun TvGuideScreen(
                                     .padding(horizontal = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(
-                                    imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                                    contentDescription = "Favori",
-                                    tint = if (isFav) Color(0xFFFACC15) else Color(0xFF475569),
+                                Box(
                                     modifier = Modifier
-                                        .size(16.dp)
-                                        .clickable { channelToAssignGroup = ch }
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
+                                        .size(26.dp)
+                                        .tvFocusableClick(
+                                            CircleShape,
+                                            defaultBorderWidth = 0.dp,
+                                            onClick = { channelToAssignGroup = ch }
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                        contentDescription = "Favori",
+                                        tint = if (isFav) Color(0xFFFACC15) else Color(0xFF475569),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(2.dp))
                                 Text(
                                     text = "${index + 1}",
                                     color = Color(0xFF94A3B8),
@@ -1782,7 +1885,6 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
     }
 }
 
-// BOUTON UNIFIÉ AVEC ESPACE CORRIGÉ POUR LA TÉLÉCOMMANDE FIRE STICK
 @Composable
 fun TvActionButton(
     text: String,
@@ -2494,7 +2596,7 @@ fun HomeDashboard(
     }
 }
 // =========================================================================
-// 3. LECTEUR VIDÉO PLEIN ÉCRAN STYLE TIVIMATE (ANTI-ÉCRAN VERT + OSD AU CLIC OK + TIMESHIFT + REPLAY MULTI-JOURS À GAUCHE)
+// 3. LECTEUR VIDÉO PLEIN ÉCRAN AVEC BARRE D'AVANCEMENT INTERACTIVE ET NAVIGATION FIRE STICK 100% FLUIDE
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -2522,7 +2624,6 @@ fun UltimateVideoPlayerScreen(
     val context = LocalContext.current
 
     var osdVisible by remember { mutableStateOf(true) }
-    var seekBarMode by remember { mutableStateOf(false) }
     var interactionTick by remember { mutableStateOf(0) }
 
     var showLeftReplayDrawer by remember { mutableStateOf(false) }
@@ -2538,6 +2639,10 @@ fun UltimateVideoPlayerScreen(
     var liveTimeshiftOffsetSec by remember(media.id, streamUrlToPlay) { mutableStateOf(0L) }
     var activeUrl by remember(streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
     var isPausedState by remember { mutableStateOf(false) }
+    var isSeekBarFocused by remember { mutableStateOf(false) }
+
+    val primaryOsdFocusRequester = remember { FocusRequester() }
+    val backgroundPlayerFocusRequester = remember { FocusRequester() }
 
     val exoPlayer = remember {
         buildSafeExoPlayer(context)
@@ -2545,15 +2650,26 @@ fun UltimateVideoPlayerScreen(
 
     LaunchedEffect(osdVisible, interactionTick, showLeftReplayDrawer, showTracksDialog) {
         if (osdVisible && !showLeftReplayDrawer && !showTracksDialog) {
-            delay(5000L)
+            delay(120L)
+            if (interactionTick <= 1) {
+                runCatching { primaryOsdFocusRequester.requestFocus() }
+            }
+            delay(6500L)
             osdVisible = false
-            seekBarMode = false
+        } else if (!osdVisible && !showLeftReplayDrawer && !showTracksDialog) {
+            delay(80L)
+            runCatching { backgroundPlayerFocusRequester.requestFocus() }
         }
     }
 
     fun wakeUpOsd() {
+        val wasHidden = !osdVisible
         osdVisible = true
-        interactionTick++
+        if (wasHidden) {
+            interactionTick = 1
+        } else {
+            interactionTick++
+        }
     }
 
     LaunchedEffect(activeUrl) {
@@ -2597,7 +2713,6 @@ fun UltimateVideoPlayerScreen(
         when {
             showTracksDialog -> showTracksDialog = false
             showLeftReplayDrawer -> showLeftReplayDrawer = false
-            seekBarMode -> seekBarMode = false
             osdVisible -> osdVisible = false
             media.type == "LIVE" -> onOpenGuide()
             else -> onBack()
@@ -2616,8 +2731,10 @@ fun UltimateVideoPlayerScreen(
     fun jumpBySeconds(deltaSec: Long) {
         wakeUpOsd()
         if (media.type != "LIVE" || isReplayMode || exoPlayer.isCurrentMediaItemSeekable) {
-            val target = (exoPlayer.currentPosition + deltaSec * 1000L).coerceAtLeast(0L)
+            val dur = exoPlayer.duration.let { if (it > 0L) it else Long.MAX_VALUE }
+            val target = (exoPlayer.currentPosition + deltaSec * 1000L).coerceIn(0L, dur)
             exoPlayer.seekTo(target)
+            currentPosMs = target
         } else if (media.tvArchive == 1 && serverUrl.isNotBlank()) {
             val progStart = currentEpg?.startTimestamp ?: (nowSec - 3600L)
             val maxBackSec = (nowSec - progStart).coerceAtLeast(3600L)
@@ -2641,77 +2758,64 @@ fun UltimateVideoPlayerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            .focusable()
-            .onKeyEvent { event ->
-                if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
-                    when (event.nativeKeyEvent.keyCode) {
-                        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
-                            if (!osdVisible && !showLeftReplayDrawer) {
-                                wakeUpOsd()
-                                true
-                            } else false
-                        }
-                        KeyEvent.KEYCODE_DPAD_LEFT -> {
-                            if (!osdVisible && !showLeftReplayDrawer && media.type == "LIVE") {
-                                showLeftReplayDrawer = true
-                                true
-                            } else if (seekBarMode) {
-                                jumpBySeconds(-60L)
-                                true
-                            } else false
-                        }
-                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                            if (seekBarMode) {
-                                jumpBySeconds(60L)
-                                true
-                            } else false
-                        }
-                        KeyEvent.KEYCODE_DPAD_UP -> {
-                            if (osdVisible && !seekBarMode) {
-                                seekBarMode = true
-                                wakeUpOsd()
-                                true
-                            } else false
-                        }
-                        KeyEvent.KEYCODE_DPAD_DOWN -> {
-                            if (seekBarMode) {
-                                seekBarMode = false
-                                wakeUpOsd()
-                                true
-                            } else if (!osdVisible && !showLeftReplayDrawer) {
-                                wakeUpOsd()
-                                true
-                            } else false
-                        }
-                        else -> false
-                    }
-                } else false
-            }
-            .clickable(
-                interactionSource = remember { MutableInteractionSource() },
-                indication = null
-            ) {
-                if (showLeftReplayDrawer) {
-                    showLeftReplayDrawer = false
-                } else {
-                    osdVisible = !osdVisible
-                    if (osdVisible) interactionTick++
-                }
-            }
     ) {
-        AndroidView(
-            factory = { ctx ->
-                PlayerView(ctx).apply {
-                    player = exoPlayer
-                    useController = false
-                    resizeMode = resizeModes[resizeModeIndex].first
+        // Zone vidéo plein écran (ne bloque jamais les flèches quand l'OSD est affiché !)
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .focusRequester(backgroundPlayerFocusRequester)
+                .focusable(enabled = !osdVisible && !showLeftReplayDrawer)
+                .onKeyEvent { event ->
+                    if (!osdVisible && !showLeftReplayDrawer && event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                        when (event.nativeKeyEvent.keyCode) {
+                            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
+                            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                                wakeUpOsd()
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                                if (media.type == "LIVE") {
+                                    showLeftReplayDrawer = true
+                                } else {
+                                    wakeUpOsd()
+                                }
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                wakeUpOsd()
+                                true
+                            }
+                            else -> false
+                        }
+                    } else false
                 }
-            },
-            update = { view ->
-                view.resizeMode = resizeModes[resizeModeIndex].first
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) {
+                    if (showLeftReplayDrawer) {
+                        showLeftReplayDrawer = false
+                    } else {
+                        osdVisible = !osdVisible
+                        if (osdVisible) interactionTick = 1
+                    }
+                }
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        player = exoPlayer
+                        useController = false
+                        isFocusable = false
+                        resizeMode = resizeModes[resizeModeIndex].first
+                    }
+                },
+                update = { view ->
+                    view.resizeMode = resizeModes[resizeModeIndex].first
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        }
 
         if (osdVisible && !showLeftReplayDrawer) {
             Row(
@@ -2748,8 +2852,8 @@ fun UltimateVideoPlayerScreen(
                     .background(
                         Brush.verticalGradient(
                             0.0f to Color.Transparent,
-                            0.18f to Color(0xCC0B0E14),
-                            0.45f to Color(0xF20B0E14),
+                            0.15f to Color(0xD90B0E14),
+                            0.45f to Color(0xF50B0E14),
                             1.0f to Color(0xFF0B0E14)
                         )
                     )
@@ -2863,119 +2967,164 @@ fun UltimateVideoPlayerScreen(
                     String.format(" [-%02d:%02d]", absSec / 60, absSec % 60)
                 } else ""
 
-                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                // BARRE D'AVANCEMENT INTERACTIVE (Utilisez Gauche / Droite directement sur la barre pour reculer/avancer !)
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    val stepSec = if (media.type == "LIVE") 60L else 30L
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(14.dp)
-                            .tvFocusableClick(
-                                RoundedCornerShape(6.dp),
-                                defaultBorderWidth = 0.dp,
-                                onFocused = { seekBarMode = true },
-                                onClick = { seekBarMode = !seekBarMode }
-                            ),
-                        contentAlignment = Alignment.CenterStart
+                            .height(26.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .border(
+                                width = if (isSeekBarFocused) 2.dp else 0.dp,
+                                color = if (isSeekBarFocused) Color(0xFF38BDF8) else Color.Transparent,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .background(if (isSeekBarFocused) Color(0xFF1E293B) else Color.Transparent)
+                            .onFocusChanged {
+                                isSeekBarFocused = it.isFocused
+                                if (it.isFocused) wakeUpOsd()
+                            }
+                            .focusable()
+                            .onKeyEvent { event ->
+                                if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                                    when (event.nativeKeyEvent.keyCode) {
+                                        KeyEvent.KEYCODE_DPAD_LEFT -> {
+                                            jumpBySeconds(-stepSec)
+                                            true
+                                        }
+                                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                                            jumpBySeconds(stepSec)
+                                            true
+                                        }
+                                        else -> false
+                                    }
+                                } else false
+                            }
+                            .padding(horizontal = 8.dp),
+                        contentAlignment = Alignment.Center
                     ) {
                         LinearProgressIndicator(
                             progress = barFraction,
-                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
-                            color = Color(0xFF38BDF8),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(if (isSeekBarFocused) 8.dp else 5.dp)
+                                .clip(CircleShape),
+                            color = if (isSeekBarFocused) Color.White else Color(0xFF38BDF8),
                             trackColor = Color(0xFF334155)
                         )
                     }
 
-                    if (seekBarMode || isReplayMode || liveTimeshiftOffsetSec < 0L || media.type != "LIVE") {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                    // RANGÉE DE CONTRÔLES LECTEUR (TOUJOURS ACCESSIBLE AVEC LES FLÈCHES DU FIRE STICK !)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column {
                             Text(
                                 text = "$elapsedMinStr / $totalMinStr$offsetMinStr",
                                 color = Color.White,
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold
                             )
+                            if (isSeekBarFocused) {
+                                Text(
+                                    text = "◀ ▶ Flèches Gauche/Droite pour reculer ou avancer",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
 
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                PlayerCircleButton("⏮", "Début") {
-                                    if (media.type == "LIVE" && currentEpg != null) {
-                                        val backToStart = currentEpg.startTimestamp - nowSec
-                                        jumpBySeconds(backToStart - liveTimeshiftOffsetSec)
-                                    } else {
-                                        exoPlayer.seekTo(0L)
-                                    }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            PlayerCircleButton("⏮ Début", "Début") {
+                                if (media.type == "LIVE" && currentEpg != null) {
+                                    val backToStart = currentEpg.startTimestamp - nowSec
+                                    jumpBySeconds(backToStart - liveTimeshiftOffsetSec)
+                                } else {
+                                    exoPlayer.seekTo(0L)
+                                    currentPosMs = 0L
                                 }
-                                PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
-                                PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
+                            }
+                            PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
+                            PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
 
-                                Box(
-                                    modifier = Modifier
-                                        .size(40.dp)
-                                        .tvFocusableClick(CircleShape, focusedBgColor = Color(0xFF38BDF8), onClick = {
-                                            wakeUpOsd()
-                                            if (exoPlayer.isPlaying) {
-                                                exoPlayer.pause()
-                                                isPausedState = true
-                                            } else {
-                                                exoPlayer.play()
-                                                isPausedState = false
-                                            }
-                                        })
-                                        .background(Color(0xFF28354E)),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = if (isPausedState) Icons.Default.PlayArrow else Icons.Default.Pause,
-                                        contentDescription = "Play/Pause",
-                                        tint = Color.White
+                            // Bouton Play/Pause (reçoit le focus automatique sur les Films/Séries !)
+                            var isPlayFocused by remember { mutableStateOf(false) }
+                            Box(
+                                modifier = Modifier
+                                    .then(
+                                        if (media.type != "LIVE") Modifier.focusRequester(primaryOsdFocusRequester)
+                                        else Modifier
                                     )
-                                }
-
-                                PlayerCircleButton("1m ⏩", "+1 min") { jumpBySeconds(60L) }
-                                PlayerCircleButton("5m ⏩", "+5 min") { jumpBySeconds(300L) }
+                                    .size(42.dp)
+                                    .clip(CircleShape)
+                                    .border(
+                                        width = if (isPlayFocused) 3.dp else 1.dp,
+                                        color = if (isPlayFocused) Color.White else Color(0xFF38BDF8),
+                                        shape = CircleShape
+                                    )
+                                    .background(if (isPlayFocused) Color(0xFF38BDF8) else Color(0xFF28354E))
+                                    .onFocusChanged {
+                                        isPlayFocused = it.isFocused
+                                        if (it.isFocused) wakeUpOsd()
+                                    }
+                                    .focusable()
+                                    .clickable {
+                                        wakeUpOsd()
+                                        if (exoPlayer.isPlaying) {
+                                            exoPlayer.pause()
+                                            isPausedState = true
+                                        } else {
+                                            exoPlayer.play()
+                                            isPausedState = false
+                                        }
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = if (isPausedState) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                    contentDescription = "Play/Pause",
+                                    tint = if (isPlayFocused) Color.Black else Color.White
+                                )
                             }
 
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                PlayerCircleButton("💬", "Audio/ST") { showTracksDialog = true }
-                                PlayerCircleButton("📐", resizeModes[resizeModeIndex].second) {
-                                    resizeModeIndex = (resizeModeIndex + 1) % resizeModes.size
-                                }
-                                if (media.type == "LIVE") {
-                                    val isBehindLive = isReplayMode || liveTimeshiftOffsetSec < 0L
-                                    Box(
-                                        modifier = Modifier
-                                            .tvFocusableClick(
-                                                RoundedCornerShape(20.dp),
-                                                defaultBorderColor = if (isBehindLive) Color(0xFF38BDF8) else Color(0xFF334155),
-                                                onClick = {
-                                                    liveTimeshiftOffsetSec = 0L
-                                                    activeUrl = media.streamUrl
-                                                    onReturnToLive()
-                                                }
-                                            )
-                                            .background(if (isBehindLive) Color(0xFF0284C7) else Color(0xFF1E293B))
-                                            .padding(horizontal = 12.dp, vertical = 6.dp)
-                                    ) {
-                                        Text(
-                                            text = "((•)) Direct",
-                                            color = Color.White,
-                                            fontSize = 12.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
+                            PlayerCircleButton("1m ⏩", "+1 min") { jumpBySeconds(60L) }
+                            PlayerCircleButton("5m ⏩", "+5 min") { jumpBySeconds(300L) }
+                        }
+
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            PlayerCircleButton("💬 Audio/ST", "Audio/ST") { showTracksDialog = true }
+                            PlayerCircleButton("📐 ${resizeModes[resizeModeIndex].second}", "Format") {
+                                wakeUpOsd()
+                                resizeModeIndex = (resizeModeIndex + 1) % resizeModes.size
+                            }
+                            if (media.type == "LIVE") {
+                                val isBehindLive = isReplayMode || liveTimeshiftOffsetSec < 0L
+                                PlayerCircleButton(
+                                    label = "((•)) Direct",
+                                    contentDesc = "Retour au direct",
+                                    isHighlighted = isBehindLive
+                                ) {
+                                    wakeUpOsd()
+                                    liveTimeshiftOffsetSec = 0L
+                                    activeUrl = media.streamUrl
+                                    onReturnToLive()
                                 }
                             }
                         }
                     }
                 }
 
+                // RANGÉE DU BAS EN DIRECT : Guide TV | Replay / Jours | Cartes des chaînes récentes
                 if (media.type == "LIVE") {
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -2986,6 +3135,8 @@ fun UltimateVideoPlayerScreen(
                             OsdBottomActionCard(
                                 icon = Icons.Default.List,
                                 title = "Guide TV",
+                                modifier = Modifier.focusRequester(primaryOsdFocusRequester),
+                                onFocused = { wakeUpOsd() },
                                 onClick = onOpenGuide
                             )
                         }
@@ -2993,6 +3144,7 @@ fun UltimateVideoPlayerScreen(
                             OsdBottomActionCard(
                                 icon = Icons.Default.History,
                                 title = "Replay / Jours",
+                                onFocused = { wakeUpOsd() },
                                 onClick = {
                                     osdVisible = false
                                     showLeftReplayDrawer = true
@@ -3006,7 +3158,12 @@ fun UltimateVideoPlayerScreen(
                                 modifier = Modifier
                                     .width(120.dp)
                                     .height(64.dp)
-                                    .tvFocusableClick(RoundedCornerShape(8.dp), onClick = { onSwitchChannel(ch) })
+                                    .tvFocusableClick(
+                                        RoundedCornerShape(8.dp),
+                                        focusedBgColor = Color(0xFF38BDF8),
+                                        onFocused = { wakeUpOsd() },
+                                        onClick = { onSwitchChannel(ch) }
+                                    )
                                     .background(if (ch.id == media.id) Color(0xFF1E293B) else Color(0xFF141A24))
                                     .padding(6.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -3020,9 +3177,9 @@ fun UltimateVideoPlayerScreen(
                                 )
                                 Text(
                                     text = chCurrent?.title ?: ch.title,
-                                    color = Color(0xFF38BDF8),
+                                    color = Color.White,
                                     fontSize = 10.sp,
-                                    fontWeight = FontWeight.SemiBold,
+                                    fontWeight = FontWeight.Bold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -3315,15 +3472,41 @@ fun TechBadge(text: String) {
 }
 
 @Composable
-fun PlayerCircleButton(label: String, contentDesc: String, onClick: () -> Unit) {
+fun PlayerCircleButton(
+    label: String,
+    contentDesc: String,
+    isHighlighted: Boolean = false,
+    onClick: () -> Unit
+) {
+    var isFocused by remember { mutableStateOf(false) }
+    val bg = when {
+        isFocused -> Color(0xFF38BDF8)
+        isHighlighted -> Color(0xFF0284C7)
+        else -> Color(0xFF1E293B)
+    }
+    val txtColor = if (isFocused) Color.Black else Color.White
+
     Box(
         modifier = Modifier
-            .tvFocusableClick(RoundedCornerShape(16.dp), onClick = onClick)
-            .background(Color(0xFF1E293B))
-            .padding(horizontal = 10.dp, vertical = 6.dp),
+            .clip(RoundedCornerShape(18.dp))
+            .border(
+                width = if (isFocused) 3.dp else 1.dp,
+                color = if (isFocused) Color.White else Color(0xFF334155),
+                shape = RoundedCornerShape(18.dp)
+            )
+            .background(bg)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+            .padding(horizontal = 12.dp, vertical = 7.dp),
         contentAlignment = Alignment.Center
     ) {
-        Text(text = label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text(
+            text = label,
+            color = txtColor,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.ExtraBold
+        )
     }
 }
 
@@ -3331,21 +3514,46 @@ fun PlayerCircleButton(label: String, contentDesc: String, onClick: () -> Unit) 
 fun OsdBottomActionCard(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     title: String,
+    modifier: Modifier = Modifier,
+    onFocused: () -> Unit = {},
     onClick: () -> Unit
 ) {
+    var isFocused by remember { mutableStateOf(false) }
     Column(
-        modifier = Modifier
-            .width(105.dp)
+        modifier = modifier
+            .width(108.dp)
             .height(64.dp)
-            .tvFocusableClick(RoundedCornerShape(8.dp), onClick = onClick)
-            .background(Color(0xFF151A24))
+            .clip(RoundedCornerShape(8.dp))
+            .border(
+                width = if (isFocused) 3.dp else 1.dp,
+                color = if (isFocused) Color.White else Color(0xFF262F40),
+                shape = RoundedCornerShape(8.dp)
+            )
+            .background(if (isFocused) Color(0xFF38BDF8) else Color(0xFF151A24))
+            .onFocusChanged {
+                isFocused = it.isFocused
+                if (it.isFocused) onFocused()
+            }
+            .focusable()
+            .clickable { onClick() }
             .padding(8.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Icon(icon, contentDescription = title, tint = Color.White, modifier = Modifier.size(22.dp))
+        Icon(
+            icon,
+            contentDescription = title,
+            tint = if (isFocused) Color.Black else Color.White,
+            modifier = Modifier.size(22.dp)
+        )
         Spacer(modifier = Modifier.height(4.dp))
-        Text(title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        Text(
+            title,
+            color = if (isFocused) Color.Black else Color.White,
+            fontSize = 11.sp,
+            fontWeight = FontWeight.ExtraBold,
+            maxLines = 1
+        )
     }
 }
 
@@ -3538,7 +3746,7 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 4. ESPACE CLIENT VERROUILLÉ PAR VOTRE PANEL D'URLS + CONTRÔLE PARENTAL OBLIGATOIRE (SANS BOUTON SWITCH)
+// 4. ESPACE CLIENT VERROUILLÉ PAR PANEL D'URLS + CODE SECRET ADMIN (888899)
 // =========================================================================
 suspend fun resolveAuthorizedServerForUser(user: String, pass: String, fallbackServer: String): String = withContext(Dispatchers.IO) {
     val candidateUrls = mutableListOf<String>()
@@ -3587,7 +3795,8 @@ fun IptvSetupScreen(
     var pass by remember { mutableStateOf(initialPass) }
     var isVerifyingPanel by remember { mutableStateOf(false) }
 
-    var adminClicks by remember { mutableStateOf(0) }
+    // Déverrouillage sécurisé uniquement par code secret (888899) tapé dans "Nom d'utilisateur"
+    var adminUnlocked by remember { mutableStateOf(false) }
     var customAdminServer by remember { mutableStateOf(initialServer) }
 
     var showChangePinDialog by remember { mutableStateOf(false) }
@@ -3617,8 +3826,7 @@ fun IptvSetupScreen(
                 text = "Espace Client & Paramètres",
                 color = Color.White,
                 fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.clickable { adminClicks++ }
+                fontWeight = FontWeight.Bold
             )
         }
 
@@ -3635,11 +3843,11 @@ fun IptvSetupScreen(
                 Text("Connexion à votre compte NeoTV", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 15.sp)
                 Text("Entrez simplement votre nom d'utilisateur et votre mot de passe :", color = Color(0xFF94A3B8), fontSize = 12.sp)
 
-                if (adminClicks >= 5) {
+                if (adminUnlocked) {
                     OutlinedTextField(
                         value = customAdminServer,
                         onValueChange = { customAdminServer = it },
-                        label = { Text("🔧 [Mode Admin] URL Serveur") },
+                        label = { Text("🔧 [Mode Admin Déverrouillé] URL Serveur") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -3647,7 +3855,14 @@ fun IptvSetupScreen(
 
                 OutlinedTextField(
                     value = user,
-                    onValueChange = { user = it },
+                    onValueChange = {
+                        if (it.trim() == SECRET_ADMIN_UNLOCK_CODE) {
+                            adminUnlocked = true
+                            user = initialUser
+                        } else {
+                            user = it
+                        }
+                    },
                     label = { Text("Nom d'utilisateur (Username)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
@@ -3662,11 +3877,22 @@ fun IptvSetupScreen(
                 )
 
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(
+                    TvActionButton(
+                        text = if (isVerifyingPanel) "Connexion en cours..." else "Se connecter",
+                        icon = Icons.Default.Check,
+                        baseBgColor = Color(0xFF8B5CF6),
+                        baseContentColor = Color.White,
+                        modifier = Modifier.weight(1f),
                         onClick = {
+                            if (isVerifyingPanel) return@TvActionButton
+                            if (user.trim() == SECRET_ADMIN_UNLOCK_CODE) {
+                                adminUnlocked = true
+                                user = initialUser
+                                return@TvActionButton
+                            }
                             isVerifyingPanel = true
                             scope.launch {
-                                val resolvedUrl = if (adminClicks >= 5 && customAdminServer.isNotBlank()) {
+                                val resolvedUrl = if (adminUnlocked && customAdminServer.isNotBlank()) {
                                     customAdminServer.trim()
                                 } else {
                                     resolveAuthorizedServerForUser(user.trim(), pass.trim(), customAdminServer.trim())
@@ -3674,16 +3900,16 @@ fun IptvSetupScreen(
                                 isVerifyingPanel = false
                                 onSave(resolvedUrl, user, pass)
                             }
-                        },
-                        enabled = !isVerifyingPanel,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF8B5CF6)),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Text(if (isVerifyingPanel) "Connexion en cours..." else "Se connecter", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-                    OutlinedButton(onClick = onCancel, modifier = Modifier.weight(1f)) {
-                        Text("Retour", color = Color.White)
-                    }
+                        }
+                    )
+                    TvActionButton(
+                        text = "Retour",
+                        icon = Icons.Default.ArrowBack,
+                        baseBgColor = Color(0xFF262F40),
+                        baseContentColor = Color.White,
+                        modifier = Modifier.weight(1f),
+                        onClick = onCancel
+                    )
                 }
             }
         }
@@ -3705,7 +3931,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC CONTRÔLE PARENTAL SANS BOUTON D'ACTIVATION/DÉSACTIVATION (TOUJOURS ACTIF !)
         item {
             Column(
                 modifier = Modifier
@@ -3807,7 +4032,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/8.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.2 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -4261,7 +4486,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/8.1 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.2 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
