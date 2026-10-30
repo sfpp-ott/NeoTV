@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonToken
+import android.view.KeyEvent
 import android.view.LayoutInflater
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
@@ -42,6 +43,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -76,6 +78,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
@@ -104,7 +107,7 @@ class MainActivity : ComponentActivity() {
                 colorScheme = darkColorScheme(
                     background = Color(0xFF0B0E14),
                     surface = Color(0xFF151A24),
-                    primary = Color(0xFF8B5CF6)
+                    primary = Color(0xFF38BDF8)
                 )
             ) {
                 NeoTvApp()
@@ -114,9 +117,10 @@ class MainActivity : ComponentActivity() {
 }
 
 fun Modifier.tvFocusableClick(
-    shape: RoundedCornerShape = RoundedCornerShape(10.dp),
+    shape: RoundedCornerShape = RoundedCornerShape(8.dp),
     defaultBorderWidth: Dp = 1.dp,
     defaultBorderColor: Color = Color(0xFF262F40),
+    focusedBgColor: Color = Color(0xFF28354E),
     onFocused: () -> Unit = {},
     onClick: () -> Unit
 ): Modifier = composed {
@@ -124,11 +128,34 @@ fun Modifier.tvFocusableClick(
     this
         .clip(shape)
         .border(
-            width = if (isFocused) 3.dp else defaultBorderWidth,
+            width = if (isFocused) 2.dp else defaultBorderWidth,
             color = if (isFocused) Color(0xFF38BDF8) else defaultBorderColor,
             shape = shape
         )
-        .background(if (isFocused) Color(0xFF28354E) else Color.Transparent)
+        .background(if (isFocused) focusedBgColor else Color.Transparent)
+        .onFocusChanged {
+            isFocused = it.isFocused
+            if (it.isFocused) onFocused()
+        }
+        .focusable()
+        .clickable { onClick() }
+}
+
+// Modificateur spécial Guide TV style TiviMate : Case blanche pleine + Texte noir quand sélectionné !
+fun Modifier.tiviGuideCellFocus(
+    isCurrentBroadcast: Boolean,
+    onFocused: () -> Unit,
+    onClick: () -> Unit
+): Modifier = composed {
+    var isFocused by remember { mutableStateOf(false) }
+    val bg = when {
+        isFocused -> Color(0xFFF1F5F9)
+        isCurrentBroadcast -> Color(0xFF243046)
+        else -> Color(0xFF161D2A)
+    }
+    this
+        .clip(RoundedCornerShape(4.dp))
+        .background(bg)
         .onFocusChanged {
             isFocused = it.isFocused
             if (it.isFocused) onFocused()
@@ -157,7 +184,8 @@ data class MediaEntry(
     val tvArchive: Int = 0,
     val tvArchiveDuration: Int = 0,
     val trailerId: String = "",
-    val isAdult: Boolean = false
+    val isAdult: Boolean = false,
+    val addedTimestamp: Long = 0L
 )
 
 data class CategoryItem(
@@ -180,6 +208,8 @@ data class EpgProgram(
     val stopTimestamp: Long,
     val startFormatted: String,
     val stopFormatted: String,
+    val dayKey: String,
+    val dayLabel: String,
     val hasArchive: Boolean
 )
 
@@ -261,23 +291,27 @@ fun NeoTvApp() {
         mutableStateOf(prefs.getStringSet("history_ids", emptySet())?.toList() ?: emptyList())
     }
 
+    var recentChannelIds by remember {
+        mutableStateOf(prefs.getStringSet("recent_live_ids", emptySet())?.toList() ?: emptyList())
+    }
+
     var epgCache by remember { mutableStateOf(emptyMap<String, List<EpgProgram>>()) }
-
-
 
     var isLoading by remember { mutableStateOf(false) }
     var statusText by remember { mutableStateOf("") }
     var errorMsg by remember { mutableStateOf<String?>(null) }
 
-    var selectedTab by rememberSaveable { mutableStateOf(0) }
+    var selectedTab by rememberSaveable { mutableStateOf(1) } // Onglet TV en direct par défaut
     var selectedCatId by rememberSaveable { mutableStateOf("ALL") }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val gridState = rememberSaveable(saver = LazyGridState.Saver) { LazyGridState() }
 
     var showSettings by remember { mutableStateOf(false) }
+    var hasAutoLaunchedLive by rememberSaveable { mutableStateOf(false) }
 
     var playingMedia by remember { mutableStateOf<MediaEntry?>(null) }
     var customStreamOverride by remember { mutableStateOf<String?>(null) }
+    var activeReplayProgram by remember { mutableStateOf<EpgProgram?>(null) }
     var startPositionMs by remember { mutableStateOf(0L) }
 
     var selectedMovieForDetails by remember { mutableStateOf<MediaEntry?>(null) }
@@ -296,6 +330,13 @@ fun NeoTvApp() {
         } else {
             action()
         }
+    }
+
+    fun recordRecentLiveChannel(channel: MediaEntry) {
+        prefs.edit().putString("last_live_channel_id", channel.id).apply()
+        val updated = (listOf(channel.id) + recentChannelIds).distinct().take(15)
+        recentChannelIds = updated
+        prefs.edit().putStringSet("recent_live_ids", updated.toSet()).apply()
     }
 
     fun toggleFavorite(id: String) {
@@ -346,15 +387,28 @@ fun NeoTvApp() {
                 val liveRes = fetchXtreamLiveStreaming(context, serverUrl, username, password, forceRefresh)
                 liveCategories = liveRes.first
                 liveChannels = liveRes.second
+
+                // LANCEMENT DIRECT SUR LA DERNIÈRE CHAÎNE TV REGARDÉE À L'ALLUMAGE (Comme sur la vidéo !)
+                if (!hasAutoLaunchedLive && liveChannels.isNotEmpty()) {
+                    hasAutoLaunchedLive = true
+                    val lastId = prefs.getString("last_live_channel_id", "") ?: ""
+                    val startChannel = liveChannels.firstOrNull { it.id == lastId && !it.isAdult }
+                        ?: liveChannels.firstOrNull { !it.isAdult }
+                    if (startChannel != null) {
+                        loadEpgForChannel(startChannel.id)
+                        recordRecentLiveChannel(startChannel)
+                        playingMedia = startChannel
+                    }
+                }
                 System.gc()
 
-                statusText = "Synchronisation Films..."
+                statusText = "Synchronisation Films (triés par ajout récent)..."
                 val vodRes = fetchXtreamVodStreaming(context, serverUrl, username, password, forceRefresh)
                 vodCategories = vodRes.first
                 vodMovies = vodRes.second
                 System.gc()
 
-                statusText = "Synchronisation Séries..."
+                statusText = "Synchronisation Séries (triées par ajout récent)..."
                 val serRes = fetchXtreamSeriesStreaming(context, serverUrl, username, password, forceRefresh)
                 seriesCategories = serRes.first
                 seriesList = serRes.second
@@ -388,11 +442,20 @@ fun NeoTvApp() {
         playingMedia != null -> {
             val currentMedia = playingMedia!!
             val progs = epgCache[currentMedia.id] ?: emptyList()
+            val recentChannels = remember(recentChannelIds, liveChannels) {
+                val map = liveChannels.associateBy { it.id }
+                val list = recentChannelIds.mapNotNull { map[it] }
+                if (list.isEmpty()) liveChannels.take(12) else list
+            }
+
             UltimateVideoPlayerScreen(
                 media = currentMedia,
                 streamUrlToPlay = customStreamOverride ?: currentMedia.streamUrl,
                 isReplayMode = customStreamOverride != null,
+                activeReplayProgram = activeReplayProgram,
                 epgList = progs,
+                epgCache = epgCache,
+                onRequestEpg = { loadEpgForChannel(it) },
                 startPositionMs = startPositionMs,
                 serverUrl = serverUrl,
                 username = username,
@@ -404,23 +467,41 @@ fun NeoTvApp() {
                         else it.categoryId == selectedCatId
                     }
                 } else emptyList(),
+                recentLiveChannels = recentChannels,
+                onOpenGuide = {
+                    // Retour direct au Guide TV avec la chaîne actuelle en cours dans le mini-lecteur !
+                    selectedTab = 1
+                    customStreamOverride = null
+                    activeReplayProgram = null
+                    playingMedia = null
+                },
                 onSwitchChannel = { nextChannel ->
                     runWithParentalCheck(nextChannel.isAdult) {
                         loadEpgForChannel(nextChannel.id)
+                        recordRecentLiveChannel(nextChannel)
                         customStreamOverride = null
+                        activeReplayProgram = null
                         startPositionMs = 0L
                         playingMedia = nextChannel
                     }
                 },
-                onPlayReplayProgram = { prog ->
-                    val replayUrl = buildCatchupUrl(serverUrl, username, password, currentMedia.id, prog.startTimestamp, prog.stopTimestamp)
-                    customStreamOverride = replayUrl
+                onPlayReplayProgram = { targetChannel, prog ->
+                    runWithParentalCheck(targetChannel.isAdult) {
+                        loadEpgForChannel(targetChannel.id)
+                        recordRecentLiveChannel(targetChannel)
+                        val replayUrl = buildCatchupUrl(serverUrl, username, password, targetChannel.id, prog.startTimestamp, prog.stopTimestamp)
+                        activeReplayProgram = prog
+                        customStreamOverride = replayUrl
+                        playingMedia = targetChannel
+                    }
                 },
-                onReturnToLive = { customStreamOverride = null },
+                onReturnToLive = {
+                    customStreamOverride = null
+                    activeReplayProgram = null
+                },
                 onSaveProgress = { pos, dur ->
                     if (currentMedia.type != "LIVE") {
                         saveWatchProgress(currentMedia.id, pos, dur)
-                        // Si c'est un épisode de série (categoryId contient l'ID de la série), on met aussi à jour la progression globale de la série !
                         if (currentMedia.id.startsWith("ep_") && currentMedia.categoryId.isNotBlank()) {
                             saveWatchProgress(currentMedia.categoryId, pos, dur)
                         }
@@ -428,6 +509,7 @@ fun NeoTvApp() {
                 },
                 onBack = {
                     customStreamOverride = null
+                    activeReplayProgram = null
                     playingMedia = null
                 }
             )
@@ -445,11 +527,13 @@ fun NeoTvApp() {
                 onPlayFromStart = {
                     startPositionMs = 0L
                     customStreamOverride = null
+                    activeReplayProgram = null
                     playingMedia = movie
                 },
                 onResumePlay = {
                     startPositionMs = savedPos
                     customStreamOverride = null
+                    activeReplayProgram = null
                     playingMedia = movie
                 },
                 onWatchTrailer = {
@@ -480,6 +564,7 @@ fun NeoTvApp() {
                     val epKey = "ep_${ep.id}"
                     startPositionMs = prefs.getLong("pos_$epKey", 0L)
                     customStreamOverride = null
+                    activeReplayProgram = null
                     prefs.edit()
                         .putString("last_ep_id_${serie.id}", ep.id)
                         .putString("last_ep_label_${serie.id}", "S${ep.season} • ${ep.title}")
@@ -524,6 +609,7 @@ fun NeoTvApp() {
                         .putString("pass", password)
                         .apply()
                     showSettings = false
+                    hasAutoLaunchedLive = false
                     loadAllXtreamData(forceRefresh = true)
                 },
                 onCancel = { showSettings = false }
@@ -538,7 +624,6 @@ fun NeoTvApp() {
                 }
             }
 
-            // Historique complet incluant Films, Chaînes ET Séries (avec affichage du dernier épisode visionné)
             val resumeItems = remember(watchHistoryIds, vodMovies, liveChannels, seriesList) {
                 val allMedia = (vodMovies + liveChannels + seriesList).associateBy { it.id }
                 watchHistoryIds.mapNotNull { id ->
@@ -590,7 +675,9 @@ fun NeoTvApp() {
                 onOpenSettings = { showSettings = true },
                 onPlayReplayFromGrid = { ch, prog ->
                     runWithParentalCheck(ch.isAdult) {
+                        recordRecentLiveChannel(ch)
                         val replayUrl = buildCatchupUrl(serverUrl, username, password, ch.id, prog.startTimestamp, prog.stopTimestamp)
+                        activeReplayProgram = prog
                         customStreamOverride = replayUrl
                         playingMedia = ch
                     }
@@ -621,7 +708,9 @@ fun NeoTvApp() {
                             }
                             else -> {
                                 loadEpgForChannel(entry.id)
+                                recordRecentLiveChannel(entry)
                                 customStreamOverride = null
+                                activeReplayProgram = null
                                 startPositionMs = 0L
                                 playingMedia = entry
                             }
@@ -632,7 +721,6 @@ fun NeoTvApp() {
         }
     }
 }
-
 @Composable
 fun MainScreen(
     selectedTab: Int,
@@ -694,7 +782,6 @@ fun MainScreen(
         }
     }
 
-    // FENÊTRE DE RECHERCHE INSTANTANÉE LETTRE PAR LETTRE AVEC APERÇU DIRECT DES RÉSULTATS
     if (showSearchDialog) {
         val allSearchable = remember(liveChannels, vodMovies, seriesList, parentalEnabled) {
             (vodMovies + seriesList + liveChannels).filter { !parentalEnabled || !it.isAdult }
@@ -752,6 +839,15 @@ fun MainScreen(
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
+                        .tvFocusableClick(CircleShape, onClick = { showSearchDialog = true })
+                        .background(Color(0xFF151A24))
+                        .padding(7.dp)
+                ) {
+                    Icon(Icons.Default.Search, contentDescription = "Rechercher", tint = Color(0xFF38BDF8), modifier = Modifier.size(16.dp))
+                }
+
+                Box(
+                    modifier = Modifier
                         .tvFocusableClick(CircleShape, onClick = onRefreshCatalog)
                         .background(Color(0xFF151A24))
                         .padding(7.dp)
@@ -796,7 +892,7 @@ fun MainScreen(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(44.dp)
+                    .height(42.dp)
                     .tvFocusableClick(
                         RoundedCornerShape(12.dp),
                         onClick = { showSearchDialog = true }
@@ -837,7 +933,7 @@ fun MainScreen(
                     modifier = Modifier.padding(bottom = 6.dp)
                 ) {
                     item {
-                        CategoryChip("Tout (${currentList.size})", selectedCatId == "ALL") {
+                        CategoryChip("Ajoutés récemment (${currentList.size})", selectedCatId == "ALL") {
                             onChangeCategory("ALL", false)
                         }
                     }
@@ -890,9 +986,6 @@ fun MainScreen(
     }
 }
 
-// =========================================================================
-// RECHERCHE INSTANTANÉE LETTRE PAR LETTRE AVEC RÉSULTATS EN DIRECT
-// =========================================================================
 @Composable
 fun InstantSearchModalDialog(
     initialQuery: String,
@@ -1058,7 +1151,7 @@ fun ParentalPinPromptDialog(
 }
 
 // =========================================================================
-// 1. GUIDE TV HORIZONTAL AVEC FAVORIS + CRÉATION DE GROUPES PERSONNALISÉS
+// 1. GUIDE TV HORIZONTAL IDENTIQUE À LA VIDÉO (LIGNE BLEUE D'HEURE ACTUELLE + FOCUS BLANC SUR LES PROGRAMMES)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1084,6 +1177,9 @@ fun TvGuideScreen(
     var showCreateGroupDialog by remember { mutableStateOf(false) }
     var channelToAssignGroup by remember { mutableStateOf<MediaEntry?>(null) }
 
+    // Panneau des catégories repliable à gauche (s'affiche ou se masque facilement comme sur la vidéo)
+    var showCategoriesSidebar by remember { mutableStateOf(true) }
+
     fun addOrRemoveChannelInGroup(groupName: String, channelId: String) {
         val key = "group_members_$groupName"
         val current = prefs.getStringSet(key, emptySet())?.toMutableSet() ?: mutableSetOf()
@@ -1104,7 +1200,10 @@ fun TvGuideScreen(
         }
     }
 
-    var previewChannel by remember(displayedChannels) { mutableStateOf(displayedChannels.firstOrNull()) }
+    val lastSavedChannelId = remember { prefs.getString("last_live_channel_id", "") ?: "" }
+    var previewChannel by remember(displayedChannels) {
+        mutableStateOf(displayedChannels.firstOrNull { it.id == lastSavedChannelId } ?: displayedChannels.firstOrNull())
+    }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
     val miniPlayer = remember {
@@ -1224,12 +1323,25 @@ fun TvGuideScreen(
         )
     }
 
-    val nowSec = System.currentTimeMillis() / 1000L
+    // HORLOGE EN TEMPS RÉEL (Rafraîchie toutes les 20s pour faire avancer la ligne bleue)
+    var nowSec by remember { mutableStateOf(System.currentTimeMillis() / 1000L) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(20_000L)
+            nowSec = System.currentTimeMillis() / 1000L
+        }
+    }
+
     val timelineStartSec = remember { (nowSec / 1800L) * 1800L }
     val timelineEndSec = remember { timelineStartSec + 6 * 3600L }
 
-    val dpPerMinute = 4f
+    // Échelle : 1 minute = 4.5.dp -> 30 minutes = 135.dp
+    val dpPerMinute = 4.5f
     val slotWidthDp = (30 * dpPerMinute).dp
+    val channelColumnWidth = 235.dp
+
+    // Calcul exact de la position de la ligne verticale bleue (avec le rond en haut)
+    val currentTimeOffsetDp = (((nowSec - timelineStartSec).coerceAtLeast(0L) / 60f) * dpPerMinute).dp
 
     val timeSlots = remember(timelineStartSec) {
         val sdf = SimpleDateFormat("HH:mm", Locale.FRANCE)
@@ -1238,58 +1350,61 @@ fun TvGuideScreen(
             sdf.format(Date(slotSec * 1000L))
         }
     }
-    val dateHeader = remember {
-        SimpleDateFormat("EEE d MMM, HH:mm", Locale.FRANCE).format(Date())
+    val dateHeader = remember(nowSec) {
+        SimpleDateFormat("EEE d MMM, HH:mm", Locale.FRANCE).format(Date(nowSec * 1000L))
     }
 
     val horizontalScrollState = rememberScrollState()
 
-    Row(modifier = Modifier.fillMaxSize().padding(top = 4.dp)) {
-        LazyColumn(
-            modifier = Modifier
-                .width(172.dp)
-                .fillMaxHeight()
-                .background(Color(0xFF0E131B))
-                .padding(6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            item {
-                CategoryRowItem("➕ Créer un groupe", false) { showCreateGroupDialog = true }
-            }
-            item {
-                CategoryRowItem("⭐ Favoris (${favorites.size})", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
-            }
-            items(customGroupNames.toList()) { gName ->
-                CategoryRowItem("📁 $gName", selectedCatId == "CUSTOM_$gName") {
-                    onSelectCategory("CUSTOM_$gName", false)
+    Row(modifier = Modifier.fillMaxSize().padding(top = 2.dp)) {
+        // COLONNE GAUCHE : CATÉGORIES (Favoris, Toutes les chaînes, FRANCE HD | TV, etc.)
+        if (showCategoriesSidebar) {
+            LazyColumn(
+                modifier = Modifier
+                    .width(170.dp)
+                    .fillMaxHeight()
+                    .background(Color(0xFF0E131B))
+                    .padding(6.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                item {
+                    CategoryRowItem("➕ Créer un groupe", false) { showCreateGroupDialog = true }
+                }
+                item {
+                    CategoryRowItem("Favoris (${favorites.size})", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
+                }
+                items(customGroupNames.toList()) { gName ->
+                    CategoryRowItem("📁 $gName", selectedCatId == "CUSTOM_$gName") {
+                        onSelectCategory("CUSTOM_$gName", false)
+                    }
+                }
+                item {
+                    CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL", false) }
+                }
+                items(categories) { cat ->
+                    val display = if (cat.isAdult) "🔒 ${cat.name}" else cat.name
+                    CategoryRowItem(display, selectedCatId == cat.id) { onSelectCategory(cat.id, cat.isAdult) }
                 }
             }
-            item {
-                CategoryRowItem("Toutes les Chaînes", selectedCatId == "ALL") { onSelectCategory("ALL", false) }
-            }
-            items(categories) { cat ->
-                val display = if (cat.isAdult) "🔒 ${cat.name}" else cat.name
-                CategoryRowItem(display, selectedCatId == cat.id) { onSelectCategory(cat.id, cat.isAdult) }
-            }
+            Spacer(modifier = Modifier.width(6.dp))
         }
 
-        Spacer(modifier = Modifier.width(8.dp))
-
         Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
+            // PARTIE HAUTE : APERÇU VIDÉO À GAUCHE + DÉTAILS DU PROGRAMME SURVOLÉ À DROITE (Exactement comme la vidéo !)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(132.dp)
-                    .background(Color(0xFF111622))
-                    .clip(RoundedCornerShape(10.dp))
-                    .padding(8.dp),
-                horizontalArrangement = Arrangement.spacedBy(14.dp)
+                    .height(142.dp)
+                    .background(Color(0xFF0B0E14))
+                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                // Mini-écran vidéo (Cliquer dessus = Plein Écran)
                 Box(
                     modifier = Modifier
-                        .width(210.dp)
+                        .width(235.dp)
                         .fillMaxHeight()
-                        .tvFocusableClick(RoundedCornerShape(8.dp), onClick = {
+                        .tvFocusableClick(RoundedCornerShape(6.dp), onClick = {
                             previewChannel?.let { onPlayChannelFullscreen(it) }
                         })
                         .background(Color.Black)
@@ -1305,6 +1420,7 @@ fun TvGuideScreen(
                     )
                 }
 
+                // Informations synchronisées avec la case blanche sélectionnée dans la grille
                 val currentChannelProgs = previewChannel?.let { epgCache[it.id] } ?: emptyList()
                 val activeProg = highlightedProgram
                     ?: currentChannelProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
@@ -1312,263 +1428,323 @@ fun TvGuideScreen(
 
                 Column(
                     modifier = Modifier.weight(1f).fillMaxHeight(),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
-                    Text(
-                        text = activeProg?.title ?: previewChannel?.title ?: "Sélectionnez une chaîne",
-                        color = Color.White,
-                        fontSize = 17.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = activeProg?.title ?: previewChannel?.title ?: "Pas d'information",
+                            color = Color.White,
+                            fontSize = 19.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                        // Nom de la catégorie tout à droite (ex: FRANCE HD | TV) comme sur la vidéo
+                        Text(
+                            text = previewChannel?.categoryName ?: "",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
 
                     if (activeProg != null) {
                         val totalDuration = (activeProg.stopTimestamp - activeProg.startTimestamp).coerceAtLeast(1L)
+                        val isNow = activeProg.startTimestamp <= nowSec && activeProg.stopTimestamp > nowSec
                         val elapsed = (nowSec - activeProg.startTimestamp).coerceIn(0L, totalDuration)
                         val progFraction = elapsed.toFloat() / totalDuration.toFloat()
-                        val remainMin = ((activeProg.stopTimestamp - nowSec) / 60L).coerceAtLeast(0L)
+                        val remainMin = if (isNow) {
+                            ((activeProg.stopTimestamp - nowSec) / 60L).coerceAtLeast(1L)
+                        } else {
+                            (totalDuration / 60L).coerceAtLeast(1L)
+                        }
 
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
                                 text = "${activeProg.startFormatted} – ${activeProg.stopFormatted}",
-                                color = Color(0xFF38BDF8),
-                                fontSize = 12.sp,
+                                color = Color(0xFFCBD5E1),
+                                fontSize = 13.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
-                            LinearProgressIndicator(
-                                progress = progFraction,
-                                modifier = Modifier.width(70.dp).height(4.dp).clip(CircleShape),
-                                color = Color(0xFF38BDF8),
-                                trackColor = Color(0xFF334155)
-                            )
-                            if (remainMin in 1..300) {
-                                Text("${remainMin} min", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                            if (isNow) {
+                                LinearProgressIndicator(
+                                    progress = progFraction,
+                                    modifier = Modifier.width(65.dp).height(4.dp).clip(CircleShape),
+                                    color = Color(0xFF38BDF8),
+                                    trackColor = Color(0xFF334155)
+                                )
                             }
+                            Text(
+                                text = "${remainMin} min",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 13.sp
+                            )
                         }
+
                         Text(
-                            text = activeProg.description.ifBlank { "En direct sur ${previewChannel?.title ?: ""}" },
-                            color = Color(0xFFCBD5E1),
-                            fontSize = 12.sp,
+                            text = activeProg.description.ifBlank { "Programme diffusé sur ${previewChannel?.title ?: ""}." },
+                            color = Color(0xFF94A3B8),
+                            fontSize = 13.sp,
                             maxLines = 3,
                             overflow = TextOverflow.Ellipsis
                         )
                     } else {
                         Text(
-                            text = previewChannel?.categoryName ?: "",
-                            color = Color(0xFF38BDF8),
-                            fontSize = 12.sp
-                        )
-                        Text(
-                            text = "Cliquez sur ⭐ à gauche d'une chaîne pour l'ajouter en Favori ou dans un Groupe personnalisé.",
-                            color = Color(0xFF94A3B8),
-                            fontSize = 12.sp,
-                            maxLines = 2
+                            text = "Pas d'information sur le programme en cours.",
+                            color = Color(0xFF64748B),
+                            fontSize = 13.sp
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(6.dp))
-
+            // BARRE DES HORAIRES (ven. 30 oct., 13:43 | 13:30 | 14:00 | 14:30 | 15:00...)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF151A24))
-                    .padding(vertical = 6.dp, horizontal = 8.dp),
+                    .background(Color(0xFF0E131B))
+                    .padding(vertical = 5.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = dateHeader,
-                    color = Color(0xFF38BDF8),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.width(240.dp)
-                )
+                Row(
+                    modifier = Modifier
+                        .width(channelColumnWidth)
+                        .clickable { showCategoriesSidebar = !showCategoriesSidebar }
+                        .padding(horizontal = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = dateHeader,
+                        color = Color(0xFF38BDF8),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
 
                 Row(modifier = Modifier.horizontalScroll(horizontalScrollState)) {
                     timeSlots.forEach { slotLabel ->
                         Box(modifier = Modifier.width(slotWidthDp)) {
-                            Text(slotLabel, color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text(slotLabel, color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
                     }
                 }
             }
 
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(3.dp)
-            ) {
-                itemsIndexed(displayedChannels, key = { _, ch -> ch.id }) { index, ch ->
-                    LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
-                    val allProgs = epgCache[ch.id] ?: emptyList()
-                    val visibleProgs = remember(allProgs, timelineStartSec) {
-                        allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
-                    }
-                    val isPlayingInMini = previewChannel?.id == ch.id
-                    val isFav = favorites.contains(ch.id)
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(48.dp)
-                            .background(if (isPlayingInMini) Color(0xFF1E293B) else Color(0xFF111622)),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        // BOUTON ÉTOILE (FAVORIS & GROUPES) SUR CHAQUE CHAÎNE
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .tvFocusableClick(
-                                    RoundedCornerShape(6.dp),
-                                    defaultBorderWidth = 0.dp,
-                                    onClick = { channelToAssignGroup = ch }
-                                ),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                                contentDescription = "Favori / Groupe",
-                                tint = if (isFav) Color(0xFFFACC15) else Color(0xFF64748B),
-                                modifier = Modifier.size(18.dp)
-                            )
+            // GRILLE DES CHAÎNES + CASES DE PROGRAMMES + LIGNE VERTICALE BLEUE DE L'HEURE ACTUELLE
+            Box(modifier = Modifier.fillMaxSize()) {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    itemsIndexed(displayedChannels, key = { _, ch -> ch.id }) { index, ch ->
+                        LaunchedEffect(ch.id) { onRequestEpg(ch.id) }
+                        val allProgs = epgCache[ch.id] ?: emptyList()
+                        val visibleProgs = remember(allProgs, timelineStartSec) {
+                            allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
                         }
+                        val isPlayingInMini = previewChannel?.id == ch.id
+                        val isFav = favorites.contains(ch.id)
 
                         Row(
                             modifier = Modifier
-                                .width(206.dp)
-                                .fillMaxHeight()
-                                .tvFocusableClick(
-                                    RoundedCornerShape(6.dp),
-                                    defaultBorderWidth = 0.dp,
-                                    onFocused = {
-                                        previewChannel = ch
-                                        highlightedProgram = visibleProgs.firstOrNull()
-                                    },
-                                    onClick = {
-                                        if (previewChannel?.id == ch.id) {
-                                            onPlayChannelFullscreen(ch)
-                                        } else {
+                                .fillMaxWidth()
+                                .height(44.dp)
+                                .background(Color(0xFF0E131B)),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // COLONNE CHAÎNE (Numéro + Logo + Titre + Flèche bleue si en cours + Horloge Replay)
+                            Row(
+                                modifier = Modifier
+                                    .width(channelColumnWidth)
+                                    .fillMaxHeight()
+                                    .tvFocusableClick(
+                                        RoundedCornerShape(4.dp),
+                                        defaultBorderWidth = 0.dp,
+                                        onFocused = {
                                             previewChannel = ch
-                                            highlightedProgram = visibleProgs.firstOrNull()
+                                            highlightedProgram = visibleProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
+                                                ?: visibleProgs.firstOrNull()
+                                        },
+                                        onClick = {
+                                            if (previewChannel?.id == ch.id) {
+                                                onPlayChannelFullscreen(ch)
+                                            } else {
+                                                previewChannel = ch
+                                            }
+                                        }
+                                    )
+                                    .padding(horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Étoile Favori / Groupe
+                                Icon(
+                                    imageVector = if (isFav) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                                    contentDescription = "Favori",
+                                    tint = if (isFav) Color(0xFFFACC15) else Color(0xFF475569),
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .clickable { channelToAssignGroup = ch }
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "${index + 1}",
+                                    color = Color(0xFF94A3B8),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.width(24.dp)
+                                )
+                                AsyncImage(
+                                    model = ch.logoUrl,
+                                    contentDescription = ch.title,
+                                    modifier = Modifier
+                                        .size(28.dp)
+                                        .clip(RoundedCornerShape(4.dp)),
+                                    contentScale = ContentScale.Fit
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = ch.title,
+                                    color = if (isPlayingInMini) Color(0xFF38BDF8) else Color.White,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (isPlayingInMini) {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        contentDescription = null,
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                                if (ch.tvArchive == 1) {
+                                    Icon(
+                                        Icons.Default.History,
+                                        contentDescription = "Replay",
+                                        tint = Color(0xFF64748B),
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                }
+                            }
+
+                            // CASES DES PROGRAMMES SUR LESQUELLES ON NAVIGUE DE HAUT EN BAS (CASE BLANCHE QUAND SÉLECTIONNÉ !)
+                            Row(
+                                modifier = Modifier
+                                    .horizontalScroll(horizontalScrollState)
+                                    .fillMaxHeight(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (visibleProgs.isEmpty()) {
+                                    repeat(6) { slotIdx ->
+                                        var isCellFocused by remember { mutableStateOf(false) }
+                                        Box(
+                                            modifier = Modifier
+                                                .width(slotWidthDp * 2)
+                                                .fillMaxHeight()
+                                                .padding(1.dp)
+                                                .onFocusChanged { isCellFocused = it.isFocused }
+                                                .tiviGuideCellFocus(
+                                                    isCurrentBroadcast = slotIdx == 0,
+                                                    onFocused = {
+                                                        previewChannel = ch
+                                                        highlightedProgram = null
+                                                    },
+                                                    onClick = {
+                                                        if (previewChannel?.id == ch.id) onPlayChannelFullscreen(ch)
+                                                        else previewChannel = ch
+                                                    }
+                                                )
+                                                .padding(horizontal = 10.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = "Pas d'information",
+                                                color = if (isCellFocused) Color.Black else Color(0xFF64748B),
+                                                fontSize = 12.sp,
+                                                fontWeight = if (isCellFocused) FontWeight.Bold else FontWeight.Normal
+                                            )
                                         }
                                     }
-                                )
-                                .padding(horizontal = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "${index + 1}",
-                                color = Color(0xFF94A3B8),
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.width(24.dp)
-                            )
-                            AsyncImage(
-                                model = ch.logoUrl,
-                                contentDescription = ch.title,
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(Color.Black),
-                                contentScale = ContentScale.Fit
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = ch.title,
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
-                            if (ch.tvArchive == 1) {
-                                Icon(
-                                    Icons.Default.History,
-                                    contentDescription = "Replay",
-                                    tint = Color(0xFF38BDF8),
-                                    modifier = Modifier.size(13.dp)
-                                )
-                            }
-                        }
+                                } else {
+                                    visibleProgs.forEach { prog ->
+                                        var isCellFocused by remember { mutableStateOf(false) }
+                                        val effectiveStart = prog.startTimestamp.coerceAtLeast(timelineStartSec)
+                                        val effectiveStop = prog.stopTimestamp.coerceAtMost(timelineEndSec)
+                                        val effectiveMinutes = ((effectiveStop - effectiveStart) / 60L).coerceAtLeast(8L)
+                                        val boxWidth = (effectiveMinutes * dpPerMinute).dp
 
-                        Row(
-                            modifier = Modifier
-                                .horizontalScroll(horizontalScrollState)
-                                .fillMaxHeight(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            if (visibleProgs.isEmpty()) {
-                                repeat(6) {
-                                    Box(
-                                        modifier = Modifier
-                                            .width(slotWidthDp * 2)
-                                            .fillMaxHeight()
-                                            .padding(1.dp)
-                                            .clip(RoundedCornerShape(4.dp))
-                                            .background(Color(0xFF181F2E))
-                                            .clickable {
-                                                if (previewChannel?.id == ch.id) onPlayChannelFullscreen(ch)
-                                                else previewChannel = ch
-                                            }
-                                            .padding(horizontal = 10.dp),
-                                        contentAlignment = Alignment.CenterStart
-                                    ) {
-                                        Text("Pas d'information", color = Color(0xFF64748B), fontSize = 11.sp)
-                                    }
-                                }
-                            } else {
-                                visibleProgs.forEach { prog ->
-                                    val effectiveStart = prog.startTimestamp.coerceAtLeast(timelineStartSec)
-                                    val effectiveStop = prog.stopTimestamp.coerceAtMost(timelineEndSec)
-                                    val effectiveMinutes = ((effectiveStop - effectiveStart) / 60L).coerceAtLeast(10L)
-                                    val boxWidth = (effectiveMinutes * dpPerMinute).dp
+                                        val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp > nowSec
+                                        val isPast = prog.stopTimestamp <= nowSec
+                                        val canReplay = isPast && (ch.tvArchive == 1 || prog.hasArchive)
 
-                                    val isCurrent = prog.startTimestamp <= nowSec && prog.stopTimestamp > nowSec
-                                    val isPast = prog.stopTimestamp <= nowSec
-                                    val canReplay = isPast && (ch.tvArchive == 1 || prog.hasArchive)
-
-                                    Box(
-                                        modifier = Modifier
-                                            .width(boxWidth)
-                                            .fillMaxHeight()
-                                            .padding(1.dp)
-                                            .tvFocusableClick(
-                                                RoundedCornerShape(4.dp),
-                                                defaultBorderWidth = 1.dp,
-                                                defaultBorderColor = if (isCurrent) Color(0xFF38BDF8) else Color(0xFF262F40),
-                                                onFocused = {
-                                                    previewChannel = ch
-                                                    highlightedProgram = prog
-                                                },
-                                                onClick = {
-                                                    highlightedProgram = prog
-                                                    if (canReplay) {
-                                                        onPlayReplayProgram(ch, prog)
-                                                    } else if (previewChannel?.id == ch.id) {
-                                                        onPlayChannelFullscreen(ch)
-                                                    } else {
+                                        Box(
+                                            modifier = Modifier
+                                                .width(boxWidth)
+                                                .fillMaxHeight()
+                                                .padding(1.dp)
+                                                .onFocusChanged { isCellFocused = it.isFocused }
+                                                .tiviGuideCellFocus(
+                                                    isCurrentBroadcast = isCurrent,
+                                                    onFocused = {
                                                         previewChannel = ch
+                                                        highlightedProgram = prog
+                                                    },
+                                                    onClick = {
+                                                        highlightedProgram = prog
+                                                        when {
+                                                            canReplay -> onPlayReplayProgram(ch, prog)
+                                                            previewChannel?.id == ch.id -> onPlayChannelFullscreen(ch)
+                                                            else -> previewChannel = ch
+                                                        }
                                                     }
-                                                }
+                                                )
+                                                .padding(horizontal = 8.dp),
+                                            contentAlignment = Alignment.CenterStart
+                                        ) {
+                                            Text(
+                                                text = prog.title,
+                                                color = if (isCellFocused) Color(0xFF0F172A) else Color.White,
+                                                fontSize = 12.sp,
+                                                fontWeight = if (isCellFocused || isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
                                             )
-                                            .background(if (isCurrent) Color(0xFF243046) else Color(0xFF181F2E))
-                                            .padding(horizontal = 8.dp),
-                                        contentAlignment = Alignment.CenterStart
-                                    ) {
-                                        Text(
-                                            text = prog.title,
-                                            color = Color.White,
-                                            fontSize = 12.sp,
-                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
+                                        }
                                     }
                                 }
                             }
                         }
+                    }
+                }
+
+                // LIGNE VERTICALE BLEUE DE L'HEURE ACTUELLE AVEC POINT ROND EN HAUT (Comme à 1:50 dans votre vidéo !)
+                if (horizontalScrollState.value == 0) {
+                    val lineX = channelColumnWidth + currentTimeOffsetDp
+                    Column(
+                        modifier = Modifier
+                            .offset(x = lineX - 4.dp)
+                            .fillMaxHeight(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFF38BDF8))
+                        )
+                        Box(
+                            modifier = Modifier
+                                .width(1.5.dp)
+                                .fillMaxHeight()
+                                .background(Color(0xAA38BDF8))
+                        )
                     }
                 }
             }
@@ -1578,18 +1754,29 @@ fun TvGuideScreen(
 
 @Composable
 fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
+    var isFocused by remember { mutableStateOf(false) }
+    val bg = when {
+        isFocused -> Color(0xFFF1F5F9)
+        isSelected -> Color(0xFF28354E)
+        else -> Color.Transparent
+    }
+    val txtColor = if (isFocused) Color(0xFF0F172A) else Color.White
+
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .tvFocusableClick(RoundedCornerShape(6.dp), defaultBorderWidth = 0.dp, onClick = onClick)
-            .background(if (isSelected) Color(0xFFE2E8F0) else Color.Transparent)
-            .padding(horizontal = 10.dp, vertical = 9.dp)
+            .clip(RoundedCornerShape(5.dp))
+            .background(bg)
+            .onFocusChanged { isFocused = it.isFocused }
+            .focusable()
+            .clickable { onClick() }
+            .padding(horizontal = 10.dp, vertical = 8.dp)
     ) {
         Text(
             text = name,
-            color = if (isSelected) Color(0xFF0F172A) else Color.White,
+            color = txtColor,
             fontSize = 12.sp,
-            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+            fontWeight = if (isSelected || isFocused) FontWeight.ExtraBold else FontWeight.Medium,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -1597,7 +1784,7 @@ fun CategoryRowItem(name: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 2. FICHE FILM : DÉGRADÉ SUR 100% DE L'ÉCRAN (ZÉRO BANDE CLAIRE EN BAS !)
+// 2. FICHE FILM & FICHE SÉRIE (TRIÉES PAR ORDRE D'AJOUT DU SERVEUR)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -1844,9 +2031,6 @@ fun MovieDetailScreen(
     }
 }
 
-// =========================================================================
-// 3. FICHE SÉRIE AVEC HISTORIQUE PAR ÉPISODE + BOUTON REPRENDRE + DÉGRADÉ
-// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun SeriesDetailScreen(
@@ -2118,7 +2302,7 @@ fun HomeDashboard(
                     ) {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             Text(
-                                text = "À L'AFFICHE • ${liveChannels.size} CHAÎNES • ${vodMovies.size} FILMS • ${seriesList.size} SÉRIES",
+                                text = "DERNIERS AJOUTS • ${liveChannels.size} CHAÎNES • ${vodMovies.size} FILMS • ${seriesList.size} SÉRIES",
                                 color = Color(0xFF38BDF8),
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.Bold
@@ -2132,7 +2316,7 @@ fun HomeDashboard(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "Direct TV • Guide des programmes • Films & Séries à la demande",
+                                text = "Direct TV • Replay • Films & Séries triés par date d'ajout",
                                 color = Color(0xFFCBD5E1),
                                 fontSize = 12.sp
                             )
@@ -2216,7 +2400,7 @@ fun HomeDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Films à l'affiche", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Derniers Films ajoutés sur le serveur", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(2) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -2235,7 +2419,7 @@ fun HomeDashboard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Séries", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Dernières Séries ajoutées sur le serveur", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                     Text("Tout voir >", color = Color(0xFF38BDF8), fontSize = 13.sp, modifier = Modifier.clickable { onSelectTab(3) })
                 }
                 Spacer(modifier = Modifier.height(10.dp))
@@ -2248,32 +2432,41 @@ fun HomeDashboard(
         }
     }
 }
-
+// =========================================================================
+// 3. LECTEUR VIDÉO PLEIN ÉCRAN STYLE TIVIMATE (SANS ICÔNES PARASITES + OSD AU CLIC OK + TIMESHIFT + REPLAY MULTI-JOURS À GAUCHE)
+// =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun UltimateVideoPlayerScreen(
     media: MediaEntry,
     streamUrlToPlay: String,
     isReplayMode: Boolean,
+    activeReplayProgram: EpgProgram?,
     epgList: List<EpgProgram>,
+    epgCache: Map<String, List<EpgProgram>>,
+    onRequestEpg: (String) -> Unit,
     startPositionMs: Long,
     serverUrl: String,
     username: String,
     password: String,
     liveChannelList: List<MediaEntry>,
+    recentLiveChannels: List<MediaEntry>,
+    onOpenGuide: () -> Unit,
     onSwitchChannel: (MediaEntry) -> Unit,
-    onPlayReplayProgram: (EpgProgram) -> Unit,
+    onPlayReplayProgram: (MediaEntry, EpgProgram) -> Unit,
     onReturnToLive: () -> Unit,
     onSaveProgress: (Long, Long) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
 
-    var controlsVisible by remember { mutableStateOf(true) }
+    // Affiche le bandeau OSD d'information 4 secondes au lancement d'une chaîne puis disparaît (plein écran 100% propre)
+    var osdVisible by remember { mutableStateOf(true) }
+    var seekBarMode by remember { mutableStateOf(false) } // Activé avec la flèche Haut quand l'OSD est ouvert !
     var interactionTick by remember { mutableStateOf(0) }
 
-    var showZappingDrawer by remember { mutableStateOf(false) }
-    var showEpgDrawer by remember { mutableStateOf(false) }
+    // Tiroir Replay à 3 colonnes (Chaînes | Programmes + Sélecteur de Jour | Résumé) quand on appuie à Gauche
+    var showLeftReplayDrawer by remember { mutableStateOf(false) }
     var showTracksDialog by remember { mutableStateOf(false) }
 
     var resizeModeIndex by remember { mutableStateOf(0) }
@@ -2283,22 +2476,25 @@ fun UltimateVideoPlayerScreen(
         AspectRatioFrameLayout.RESIZE_MODE_FILL to "Étiré 16:9"
     )
 
-    var liveTimeshiftMinutes by remember { mutableStateOf(0) }
+    // Gestion du recul sur le direct (Timeshift minute par minute comme sur la vidéo)
+    var liveTimeshiftOffsetSec by remember(media.id, streamUrlToPlay) { mutableStateOf(0L) }
     var activeUrl by remember(streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
+    var isPausedState by remember { mutableStateOf(false) }
 
     val exoPlayer = remember {
         ExoPlayer.Builder(context).build()
     }
 
-    LaunchedEffect(controlsVisible, interactionTick, showZappingDrawer, showEpgDrawer, showTracksDialog) {
-        if (controlsVisible && !showZappingDrawer && !showEpgDrawer && !showTracksDialog) {
-            delay(4000)
-            controlsVisible = false
+    LaunchedEffect(osdVisible, interactionTick, showLeftReplayDrawer, showTracksDialog) {
+        if (osdVisible && !showLeftReplayDrawer && !showTracksDialog) {
+            delay(5000L)
+            osdVisible = false
+            seekBarMode = false
         }
     }
 
-    fun wakeUpControls() {
-        controlsVisible = true
+    fun wakeUpOsd() {
+        osdVisible = true
         interactionTick++
     }
 
@@ -2309,14 +2505,20 @@ fun UltimateVideoPlayerScreen(
             exoPlayer.seekTo(startPositionMs)
         }
         exoPlayer.playWhenReady = true
-        wakeUpControls()
+        isPausedState = false
+        wakeUpOsd()
     }
 
-    LaunchedEffect(media.id) {
+    var currentPosMs by remember { mutableStateOf(0L) }
+    var totalDurMs by remember { mutableStateOf(1L) }
+
+    LaunchedEffect(media.id, activeUrl) {
         while (true) {
-            delay(5000)
+            delay(1000L)
+            currentPosMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+            totalDurMs = exoPlayer.duration.coerceAtLeast(1L)
             if (exoPlayer.isPlaying && media.type != "LIVE") {
-                onSaveProgress(exoPlayer.currentPosition, exoPlayer.duration)
+                onSaveProgress(currentPosMs, totalDurMs)
             }
         }
     }
@@ -2333,52 +2535,118 @@ fun UltimateVideoPlayerScreen(
     BackHandler {
         when {
             showTracksDialog -> showTracksDialog = false
-            showZappingDrawer -> showZappingDrawer = false
-            showEpgDrawer -> showEpgDrawer = false
+            showLeftReplayDrawer -> showLeftReplayDrawer = false
+            seekBarMode -> seekBarMode = false
+            osdVisible -> osdVisible = false
+            media.type == "LIVE" -> onOpenGuide() // Retour sur une chaîne TV = retourne au Guide TV avec l'aperçu !
             else -> onBack()
         }
     }
 
-    fun seekLiveOrTimeshift(deltaSeconds: Int) {
-        wakeUpControls()
-        if (exoPlayer.isCurrentMediaItemSeekable || media.type != "LIVE" || isReplayMode) {
-            val target = (exoPlayer.currentPosition + deltaSeconds * 1000L).coerceAtLeast(0L)
+    val nowSec = System.currentTimeMillis() / 1000L
+    val currentEpg = activeReplayProgram
+        ?: epgList.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
+        ?: epgList.firstOrNull()
+    val nextEpg = remember(epgList, currentEpg) {
+        if (currentEpg == null) null
+        else epgList.firstOrNull { it.startTimestamp >= currentEpg.stopTimestamp }
+    }
+
+    // Fonction pour reculer ou avancer dans l'émission en direct (Timeshift) ou dans un Replay/Film
+    fun jumpBySeconds(deltaSec: Long) {
+        wakeUpOsd()
+        if (media.type != "LIVE" || isReplayMode || exoPlayer.isCurrentMediaItemSeekable) {
+            val target = (exoPlayer.currentPosition + deltaSec * 1000L).coerceAtLeast(0L)
             exoPlayer.seekTo(target)
         } else if (media.tvArchive == 1 && serverUrl.isNotBlank()) {
-            val addMin = if (deltaSeconds < 0) -1 else 1
-            liveTimeshiftMinutes = (liveTimeshiftMinutes + addMin).coerceAtMost(0)
-            if (liveTimeshiftMinutes < 0) {
-                val startSec = (System.currentTimeMillis() / 1000L) + (liveTimeshiftMinutes * 60L)
-                activeUrl = buildCatchupUrl(serverUrl, username, password, media.id, startSec, startSec + 3600L)
+            val progStart = currentEpg?.startTimestamp ?: (nowSec - 3600L)
+            val maxBackSec = (nowSec - progStart).coerceAtLeast(3600L)
+            liveTimeshiftOffsetSec = (liveTimeshiftOffsetSec + deltaSec).coerceIn(-maxBackSec, 0L)
+            if (liveTimeshiftOffsetSec < -10L) {
+                val targetUnixSec = nowSec + liveTimeshiftOffsetSec
+                activeUrl = buildCatchupUrl(serverUrl, username, password, media.id, targetUnixSec, targetUnixSec + 7200L)
             } else {
+                liveTimeshiftOffsetSec = 0L
                 activeUrl = media.streamUrl
+                onReturnToLive()
             }
         }
     }
 
-    val nowSec = System.currentTimeMillis() / 1000L
+    val dateTopRight = remember(nowSec) {
+        SimpleDateFormat("EEE d MMM, HH:mm", Locale.FRANCE).format(Date(nowSec * 1000L))
+    }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .focusable()
+            .onKeyEvent { event ->
+                if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
+                    when (event.nativeKeyEvent.keyCode) {
+                        KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
+                            if (!osdVisible && !showLeftReplayDrawer) {
+                                wakeUpOsd()
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_LEFT -> {
+                            if (!osdVisible && !showLeftReplayDrawer && media.type == "LIVE") {
+                                // Appui à gauche en plein écran = Ouvre le panneau Chaînes + Replay par jour !
+                                showLeftReplayDrawer = true
+                                true
+                            } else if (seekBarMode) {
+                                jumpBySeconds(-60L) // Recule d'1 minute sur la barre de progression !
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                            if (seekBarMode) {
+                                jumpBySeconds(60L) // Avance d'1 minute sur la barre de progression !
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_UP -> {
+                            if (osdVisible && !seekBarMode) {
+                                seekBarMode = true
+                                wakeUpOsd()
+                                true
+                            } else false
+                        }
+                        KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (seekBarMode) {
+                                seekBarMode = false
+                                wakeUpOsd()
+                                true
+                            } else if (!osdVisible && !showLeftReplayDrawer) {
+                                wakeUpOsd()
+                                true
+                            } else false
+                        }
+                        else -> false
+                    }
+                } else false
+            }
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
             ) {
-                controlsVisible = !controlsVisible
-                if (controlsVisible) interactionTick++
+                if (showLeftReplayDrawer) {
+                    showLeftReplayDrawer = false
+                } else {
+                    osdVisible = !osdVisible
+                    if (osdVisible) interactionTick++
+                }
             }
     ) {
+        // 1. LECTEUR PLEIN ÉCRAN SANS AUCUN CONTRÔLEUR PARASITE (useController = false)
         AndroidView(
             factory = { ctx ->
                 PlayerView(ctx).apply {
                     player = exoPlayer
-                    useController = true
+                    useController = false // ZÉRO ICÔNE PARASITE À L'ALLUMAGE !
                     resizeMode = resizeModes[resizeModeIndex].first
-                    setControllerVisibilityListener(PlayerView.ControllerVisibilityListener { visibility ->
-                        controlsVisible = (visibility == android.view.View.VISIBLE)
-                    })
                 }
             },
             update = { view ->
@@ -2387,193 +2655,356 @@ fun UltimateVideoPlayerScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        if (controlsVisible) {
-            Column(
+        // 2. BANDEAU D'INFORMATION TIVIMATE (EN HAUT ET EN BAS QUAND ON APPUIE SUR OK)
+        if (osdVisible && !showLeftReplayDrawer) {
+            // En-tête discret en haut : Catégorie à gauche | Date & Heure à droite (comme à 3:38 dans la vidéo)
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(
                         Brush.verticalGradient(
-                            listOf(Color(0xDD000000), Color(0x99000000), Color.Transparent)
+                            listOf(Color(0xCC000000), Color.Transparent)
                         )
                     )
-                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .padding(horizontal = 24.dp, vertical = 14.dp)
+                    .align(Alignment.TopCenter),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                Text(
+                    text = media.categoryName.ifBlank { "TV EN DIRECT" },
+                    color = Color(0xFFE2E8F0),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = dateTopRight,
+                    color = Color(0xFFE2E8F0),
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            // Bandeau complet en bas style TiviMate
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.BottomCenter)
+                    .background(
+                        Brush.verticalGradient(
+                            0.0f to Color.Transparent,
+                            0.18f to Color(0xCC0B0E14),
+                            0.45f to Color(0xF20B0E14),
+                            1.0f to Color(0xFF0B0E14)
+                        )
+                    )
+                    .padding(horizontal = 26.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Ligne principale : Grand Logo Chaîne + Titre Émission + Horaires + Badges FHD / 50 FPS / STEREO
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(18.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
-                        IconButton(onClick = onBack) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
-                        }
-                        Column {
-                            Text(text = media.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            val currentEpg = epgList.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec } ?: epgList.firstOrNull()
+                    Box(
+                        modifier = Modifier
+                            .width(96.dp)
+                            .height(58.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(Color(0xFF161D2A))
+                            .padding(6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AsyncImage(
+                            model = media.logoUrl,
+                            contentDescription = media.title,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Text(
+                            text = currentEpg?.title ?: media.title,
+                            color = Color.White,
+                            fontSize = 20.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
                             if (currentEpg != null) {
+                                val totalDurSec = (currentEpg.stopTimestamp - currentEpg.startTimestamp).coerceAtLeast(1L)
+                                val elapsedSec = (nowSec + liveTimeshiftOffsetSec - currentEpg.startTimestamp).coerceIn(0L, totalDurSec)
+                                val frac = elapsedSec.toFloat() / totalDurSec.toFloat()
+                                val remainMin = ((currentEpg.stopTimestamp - nowSec) / 60L).coerceAtLeast(0L)
+
                                 Text(
-                                    text = "${currentEpg.startFormatted}-${currentEpg.stopFormatted} : ${currentEpg.title}",
+                                    text = "${currentEpg.startFormatted} – ${currentEpg.stopFormatted}",
+                                    color = Color(0xFFCBD5E1),
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                LinearProgressIndicator(
+                                    progress = frac,
+                                    modifier = Modifier.width(65.dp).height(4.dp).clip(CircleShape),
                                     color = Color(0xFF38BDF8),
-                                    fontSize = 12.sp,
+                                    trackColor = Color(0xFF334155)
+                                )
+                                Text(
+                                    text = "${remainMin} min",
+                                    color = Color(0xFF94A3B8),
+                                    fontSize = 13.sp
+                                )
+                            }
+
+                            Text(
+                                text = media.title,
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            // Badges techniques FHD | 50 FPS | STEREO comme sur la vidéo
+                            TechBadge("FHD")
+                            TechBadge("50 FPS")
+                            TechBadge("STEREO")
+                        }
+
+                        if (nextEpg != null) {
+                            Text(
+                                text = "${nextEpg.startFormatted} – ${nextEpg.stopFormatted}  ${nextEpg.title}",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 12.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+
+                // BARRE DE PROGRESSION TIMESHIFT / REPLAY AVEC CONTRÔLES (S'ouvre avec Flèche Haut comme à 3:42 !)
+                val progDurationSec = if (currentEpg != null) {
+                    (currentEpg.stopTimestamp - currentEpg.startTimestamp).coerceAtLeast(60L)
+                } else {
+                    (totalDurMs / 1000L).coerceAtLeast(60L)
+                }
+                val progElapsedSec = if (media.type == "LIVE" && !isReplayMode && currentEpg != null) {
+                    ((nowSec - currentEpg.startTimestamp) + liveTimeshiftOffsetSec).coerceIn(0L, progDurationSec)
+                } else {
+                    (currentPosMs / 1000L).coerceIn(0L, progDurationSec)
+                }
+                val barFraction = (progElapsedSec.toFloat() / progDurationSec.toFloat()).coerceIn(0f, 1f)
+
+                val elapsedMinStr = String.format("%02d:%02d", progElapsedSec / 60, progElapsedSec % 60)
+                val totalMinStr = String.format("%02d:%02d", progDurationSec / 60, progDurationSec % 60)
+                val offsetMinStr = if (liveTimeshiftOffsetSec < 0L) {
+                    val absSec = kotlin.math.abs(liveTimeshiftOffsetSec)
+                    String.format(" [-%02d:%02d]", absSec / 60, absSec % 60)
+                } else ""
+
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // Ligne de progression bleue avec curseur rond blanc/bleu
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(14.dp)
+                            .tvFocusableClick(
+                                RoundedCornerShape(6.dp),
+                                defaultBorderWidth = 0.dp,
+                                onFocused = { seekBarMode = true },
+                                onClick = { seekBarMode = !seekBarMode }
+                            ),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        LinearProgressIndicator(
+                            progress = barFraction,
+                            modifier = Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
+                            color = Color(0xFF38BDF8),
+                            trackColor = Color(0xFF334155)
+                        )
+                    }
+
+                    if (seekBarMode || isReplayMode || liveTimeshiftOffsetSec < 0L || media.type != "LIVE") {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Temps écoulé : ex "45:26 / 50:00 [-01:00]" (Exactement comme à 3:59 !)
+                            Text(
+                                text = "$elapsedMinStr / $totalMinStr$offsetMinStr",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            // Boutons centraux : Début | -5 min | -1 min | Play/Pause | +1 min | +5 min
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                PlayerCircleButton("⏮", "Début") {
+                                    if (media.type == "LIVE" && currentEpg != null) {
+                                        val backToStart = currentEpg.startTimestamp - nowSec
+                                        jumpBySeconds(backToStart - liveTimeshiftOffsetSec)
+                                    } else {
+                                        exoPlayer.seekTo(0L)
+                                    }
+                                }
+                                PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
+                                PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
+
+                                // Bouton central Pause / Lecture
+                                Box(
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .tvFocusableClick(CircleShape, focusedBgColor = Color.White, onClick = {
+                                            wakeUpOsd()
+                                            if (exoPlayer.isPlaying) {
+                                                exoPlayer.pause()
+                                                isPausedState = true
+                                            } else {
+                                                exoPlayer.play()
+                                                isPausedState = false
+                                            }
+                                        })
+                                        .background(Color(0xFF28354E)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        imageVector = if (isPausedState) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                        contentDescription = "Play/Pause",
+                                        tint = Color.White
+                                    )
+                                }
+
+                                PlayerCircleButton("1m ⏩", "+1 min") { jumpBySeconds(60L) }
+                                PlayerCircleButton("5m ⏩", "+5 min") { jumpBySeconds(300L) }
+                            }
+
+                            // Boutons de droite : Format image | Audio/ST | Bouton "Direct" (comme à 4:38 !)
+                            Row(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                PlayerCircleButton("💬", "Audio/ST") { showTracksDialog = true }
+                                PlayerCircleButton("📐", resizeModes[resizeModeIndex].second) {
+                                    resizeModeIndex = (resizeModeIndex + 1) % resizeModes.size
+                                }
+                                if (media.type == "LIVE") {
+                                    val isBehindLive = isReplayMode || liveTimeshiftOffsetSec < 0L
+                                    Box(
+                                        modifier = Modifier
+                                            .tvFocusableClick(
+                                                RoundedCornerShape(20.dp),
+                                                defaultBorderColor = if (isBehindLive) Color(0xFF38BDF8) else Color(0xFF334155),
+                                                onClick = {
+                                                    liveTimeshiftOffsetSec = 0L
+                                                    activeUrl = media.streamUrl
+                                                    onReturnToLive()
+                                                }
+                                            )
+                                            .background(if (isBehindLive) Color(0xFF0284C7) else Color(0xFF1E293B))
+                                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Text(
+                                            text = "((•)) Direct",
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // RANGÉE DU BAS : Guide TV | Historique (Replay) | Cartes des chaînes récentes (TF1, Canal+, BFM, M6...)
+                if (media.type == "LIVE") {
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 4.dp)
+                    ) {
+                        item {
+                            OsdBottomActionCard(
+                                icon = Icons.Default.List,
+                                title = "Guide TV",
+                                onClick = onOpenGuide
+                            )
+                        }
+                        item {
+                            OsdBottomActionCard(
+                                icon = Icons.Default.History,
+                                title = "Replay / Jours",
+                                onClick = {
+                                    osdVisible = false
+                                    showLeftReplayDrawer = true
+                                }
+                            )
+                        }
+                        items(recentLiveChannels, key = { "rec_${it.id}" }) { ch ->
+                            val chProgs = epgCache[ch.id] ?: emptyList()
+                            val chCurrent = chProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
+                            Column(
+                                modifier = Modifier
+                                    .width(120.dp)
+                                    .height(64.dp)
+                                    .tvFocusableClick(RoundedCornerShape(8.dp), onClick = { onSwitchChannel(ch) })
+                                    .background(if (ch.id == media.id) Color(0xFF1E293B) else Color(0xFF141A24))
+                                    .padding(6.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                AsyncImage(
+                                    model = ch.logoUrl,
+                                    contentDescription = ch.title,
+                                    modifier = Modifier.height(28.dp).fillMaxWidth(),
+                                    contentScale = ContentScale.Fit
+                                )
+                                Text(
+                                    text = chCurrent?.title ?: ch.title,
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
                             }
                         }
                     }
-
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        SmallControlChip(
-                            label = "📐 ${resizeModes[resizeModeIndex].second}",
-                            onClick = {
-                                wakeUpControls()
-                                resizeModeIndex = (resizeModeIndex + 1) % resizeModes.size
-                            }
-                        )
-                        SmallControlChip(
-                            label = "💬 Audio / ST",
-                            onClick = {
-                                wakeUpControls()
-                                showTracksDialog = true
-                            }
-                        )
-                        if (media.type == "LIVE") {
-                            SmallControlChip(
-                                label = "📅 Guide & Replay",
-                                isActive = showEpgDrawer,
-                                onClick = {
-                                    wakeUpControls()
-                                    showZappingDrawer = false
-                                    showEpgDrawer = !showEpgDrawer
-                                }
-                            )
-                        }
-                        if (liveChannelList.isNotEmpty()) {
-                            SmallControlChip(
-                                label = if (showZappingDrawer) "Fermer" else "📺 Chaînes",
-                                isActive = showZappingDrawer,
-                                onClick = {
-                                    wakeUpControls()
-                                    showEpgDrawer = false
-                                    showZappingDrawer = !showZappingDrawer
-                                }
-                            )
-                        }
-                    }
-                }
-
-                if (media.type == "LIVE") {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(start = 48.dp)
-                    ) {
-                        SmallControlChip(label = "⏪ -1 min", onClick = { seekLiveOrTimeshift(-60) })
-                        SmallControlChip(label = "⏪ -15s", onClick = { seekLiveOrTimeshift(-15) })
-                        SmallControlChip(label = "⏩ +15s", onClick = { seekLiveOrTimeshift(15) })
-                        if (isReplayMode || liveTimeshiftMinutes < 0) {
-                            SmallControlChip(
-                                label = "🔴 Direct",
-                                isActive = true,
-                                onClick = {
-                                    liveTimeshiftMinutes = 0
-                                    activeUrl = media.streamUrl
-                                    onReturnToLive()
-                                }
-                            )
-                        }
-                    }
                 }
             }
         }
 
-        if (showZappingDrawer && liveChannelList.isNotEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxHeight()
-                    .width(280.dp)
-                    .padding(top = 80.dp)
-                    .background(Color(0xEB0B0E14))
-                    .border(1.dp, Color(0xFF262F40))
-            ) {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    items(liveChannelList, key = { it.id }) { ch ->
-                        val isCurrent = ch.id == media.id
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .tvFocusableClick(RoundedCornerShape(8.dp), onClick = { onSwitchChannel(ch) })
-                                .background(if (isCurrent) Color(0xFF8B5CF6) else Color(0xFF151A24))
-                                .padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            AsyncImage(
-                                model = ch.logoUrl,
-                                contentDescription = ch.title,
-                                modifier = Modifier.size(34.dp).clip(RoundedCornerShape(6.dp)).background(Color.Black),
-                                contentScale = ContentScale.Fit
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(ch.title, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
+        // 3. PANNEAU REPLAY & EPG MULTI-JOURS À GAUCHE (Comme à 5:12 - 6:00 dans votre vidéo !)
+        if (showLeftReplayDrawer && liveChannelList.isNotEmpty()) {
+            TiviMateLeftReplayOverlay(
+                channels = liveChannelList,
+                initialChannel = media,
+                epgCache = epgCache,
+                onRequestEpg = onRequestEpg,
+                onSelectChannelOrReplay = { chosenCh, chosenProg ->
+                    showLeftReplayDrawer = false
+                    val isPast = chosenProg != null && chosenProg.stopTimestamp <= nowSec
+                    if (isPast && (chosenCh.tvArchive == 1 || chosenProg?.hasArchive == true)) {
+                        onPlayReplayProgram(chosenCh, chosenProg!!)
+                    } else {
+                        onSwitchChannel(chosenCh)
                     }
-                }
-            }
-        }
-
-        if (showEpgDrawer) {
-            Box(
-                modifier = Modifier
-                    .fillMaxHeight()
-                    .width(330.dp)
-                    .align(Alignment.CenterEnd)
-                    .padding(top = 80.dp)
-                    .background(Color(0xEB0B0E14))
-                    .border(1.dp, Color(0xFF262F40))
-            ) {
-                LazyColumn(
-                    modifier = Modifier.fillMaxSize().padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    item {
-                        Text("Guide TV & Replay", color = Color(0xFF38BDF8), fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                    }
-                    items(epgList) { prog ->
-                        val isPast = prog.stopTimestamp in 1 until nowSec
-                        val canReplay = isPast && (media.tvArchive == 1 || prog.hasArchive)
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .tvFocusableClick(
-                                    RoundedCornerShape(8.dp),
-                                    onClick = {
-                                        if (canReplay) {
-                                            showEpgDrawer = false
-                                            onPlayReplayProgram(prog)
-                                        }
-                                    }
-                                )
-                                .background(Color(0xFF151A24))
-                                .padding(10.dp)
-                        ) {
-                            Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-                                Text("${prog.startFormatted} - ${prog.stopFormatted}", color = Color(0xFF38BDF8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                if (canReplay) {
-                                    Text("⏪ REPLAY", color = Color(0xFFA855F7), fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                            Text(prog.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                            if (prog.description.isNotBlank()) {
-                                Text(prog.description, color = Color(0xFF94A3B8), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
-                    }
-                }
-            }
+                },
+                onClose = { showLeftReplayDrawer = false }
+            )
         }
 
         if (showTracksDialog) {
@@ -2582,15 +3013,303 @@ fun UltimateVideoPlayerScreen(
     }
 }
 
+// =========================================================================
+// PANNEAU TRANSPARENT 3 COLONNES (CHAÎNES | PROGRAMMES + CHOIX DU JOUR | RÉSUMÉ) COMME À 5:35 DANS LA VIDÉO
+// =========================================================================
 @Composable
-fun SmallControlChip(label: String, isActive: Boolean = false, onClick: () -> Unit) {
+fun TiviMateLeftReplayOverlay(
+    channels: List<MediaEntry>,
+    initialChannel: MediaEntry,
+    epgCache: Map<String, List<EpgProgram>>,
+    onRequestEpg: (String) -> Unit,
+    onSelectChannelOrReplay: (MediaEntry, EpgProgram?) -> Unit,
+    onClose: () -> Unit
+) {
+    var selectedChannel by remember { mutableStateOf(initialChannel) }
+    LaunchedEffect(selectedChannel.id) {
+        onRequestEpg(selectedChannel.id)
+    }
+
+    val channelPrograms = epgCache[selectedChannel.id] ?: emptyList()
+    val nowSec = System.currentTimeMillis() / 1000L
+
+    // Liste des jours disponibles (ex: sam. 24 oct., dim. 25 oct., lun. 26 oct. ... ven. 30 oct.)
+    val availableDays = remember(channelPrograms) {
+        val pairs = channelPrograms.map { it.dayKey to it.dayLabel }.distinctBy { it.first }
+        if (pairs.isEmpty()) {
+            val todayKey = SimpleDateFormat("yyyy-MM-dd", Locale.FRANCE).format(Date())
+            val todayLbl = SimpleDateFormat("EEE,\nd MMM", Locale.FRANCE).format(Date())
+            listOf(todayKey to todayLbl)
+        } else pairs
+    }
+
+    val todayKey = remember { SimpleDateFormat("yyyy-MM-dd", Locale.FRANCE).format(Date()) }
+    var selectedDayKey by remember(selectedChannel.id, availableDays) {
+        mutableStateOf(
+            availableDays.firstOrNull { it.first == todayKey }?.first
+                ?: availableDays.lastOrNull()?.first
+                ?: todayKey
+        )
+    }
+
+    val dayPrograms = remember(channelPrograms, selectedDayKey) {
+        channelPrograms.filter { it.dayKey == selectedDayKey }
+    }
+
+    var focusedProg by remember(dayPrograms) {
+        mutableStateOf(
+            dayPrograms.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
+                ?: dayPrograms.lastOrNull()
+        )
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xD90B0E14))
+            .padding(16.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        // COLONNE 1 : LISTE DES CHAÎNES À GAUCHE
+        LazyColumn(
+            modifier = Modifier
+                .width(225.dp)
+                .fillMaxHeight()
+                .background(Color(0x99111622))
+                .padding(6.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            itemsIndexed(channels, key = { _, ch -> "ov_${ch.id}" }) { idx, ch ->
+                val isSelected = ch.id == selectedChannel.id
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .tvFocusableClick(
+                            RoundedCornerShape(6.dp),
+                            defaultBorderWidth = 0.dp,
+                            focusedBgColor = Color(0xFFF1F5F9),
+                            onFocused = { selectedChannel = ch },
+                            onClick = { onSelectChannelOrReplay(ch, null) }
+                        )
+                        .background(if (isSelected) Color(0xFF243046) else Color.Transparent)
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("${idx + 1}", color = Color(0xFF94A3B8), fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp))
+                    AsyncImage(
+                        model = ch.logoUrl,
+                        contentDescription = ch.title,
+                        modifier = Modifier.size(30.dp).clip(RoundedCornerShape(4.dp)),
+                        contentScale = ContentScale.Fit
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = ch.title,
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        // COLONNE 2 : PROGRAMMES DU JOUR CHOISI + COLONNE DES JOURS (lun. 26 oct., mar. 27 oct., ven. 30 oct.)
+        Column(
+            modifier = Modifier
+                .width(390.dp)
+                .fillMaxHeight()
+                .background(Color(0x99111622))
+                .padding(10.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                AsyncImage(
+                    model = selectedChannel.logoUrl,
+                    contentDescription = null,
+                    modifier = Modifier.size(36.dp),
+                    contentScale = ContentScale.Fit
+                )
+                Column {
+                    Text(selectedChannel.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(selectedChannel.categoryName, color = Color(0xFF38BDF8), fontSize = 11.sp)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
+            Row(modifier = Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                // Liste des émissions du jour avec horaire et icône Replay
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxHeight(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    if (dayPrograms.isEmpty()) {
+                        item {
+                            Text("Aucun programme archivé pour ce jour.", color = Color(0xFF94A3B8), fontSize = 13.sp, modifier = Modifier.padding(12.dp))
+                        }
+                    } else {
+                        items(dayPrograms) { prog ->
+                            var isFocused by remember { mutableStateOf(false) }
+                            val isNow = prog.startTimestamp <= nowSec && prog.stopTimestamp > nowSec
+                            val isPast = prog.stopTimestamp <= nowSec
+                            val canReplay = isPast && (selectedChannel.tvArchive == 1 || prog.hasArchive)
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .onFocusChanged { isFocused = it.isFocused }
+                                    .tiviGuideCellFocus(
+                                        isCurrentBroadcast = isNow,
+                                        onFocused = { focusedProg = prog },
+                                        onClick = { onSelectChannelOrReplay(selectedChannel, prog) }
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = prog.startFormatted,
+                                    color = if (isFocused) Color.Black else Color(0xFF38BDF8),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = prog.title,
+                                    color = if (isFocused) Color.Black else Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isNow || isFocused) FontWeight.Bold else FontWeight.Normal,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (canReplay) {
+                                    Icon(
+                                        Icons.Default.History,
+                                        contentDescription = "Replay disponible",
+                                        tint = if (isFocused) Color.Black else Color(0xFF38BDF8),
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Sélecteur vertical de Jours (sam. 24 oct., dim. 25 oct., lun. 26 oct. ... ven. 30 oct.) comme à 5:45 !
+                LazyColumn(
+                    modifier = Modifier
+                        .width(74.dp)
+                        .fillMaxHeight()
+                        .background(Color(0xFF0E131B))
+                        .padding(4.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(availableDays, key = { it.first }) { (dKey, dLabel) ->
+                        val isDaySelected = dKey == selectedDayKey
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .tvFocusableClick(
+                                    RoundedCornerShape(6.dp),
+                                    defaultBorderWidth = if (isDaySelected) 1.dp else 0.dp,
+                                    defaultBorderColor = if (isDaySelected) Color.White else Color.Transparent,
+                                    onClick = { selectedDayKey = dKey }
+                                )
+                                .background(if (isDaySelected) Color(0xFF28354E) else Color.Transparent)
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = dLabel,
+                                color = if (isDaySelected) Color.White else Color(0xFF94A3B8),
+                                fontSize = 11.sp,
+                                fontWeight = if (isDaySelected) FontWeight.ExtraBold else FontWeight.Medium
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // COLONNE 3 : DESCRIPTION DÉTAILLÉE DU PROGRAMME SÉLECTIONNÉ À DROITE
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = focusedProg?.title ?: selectedChannel.title,
+                color = Color.White,
+                fontSize = 19.sp,
+                fontWeight = FontWeight.ExtraBold
+            )
+            if (focusedProg != null) {
+                val durMin = ((focusedProg!!.stopTimestamp - focusedProg!!.startTimestamp) / 60L).coerceAtLeast(1L)
+                Text(
+                    text = "${focusedProg!!.dayLabel.replace("\n", " ")} • ${focusedProg!!.startFormatted} – ${focusedProg!!.stopFormatted} • ${durMin} min",
+                    color = Color(0xFF38BDF8),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = focusedProg!!.description.ifBlank { "Appuyez sur OK pour lancer ce programme en Replay ou en Direct." },
+                    color = Color(0xFFE2E8F0),
+                    fontSize = 13.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun TechBadge(text: String) {
     Box(
         modifier = Modifier
-            .tvFocusableClick(CircleShape, onClick = onClick)
-            .background(if (isActive) Color(0xFF8B5CF6) else Color(0xCC1E293B))
-            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .clip(RoundedCornerShape(4.dp))
+            .background(Color(0xFF262F40))
+            .border(1.dp, Color(0xFF475569), RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp)
     ) {
-        Text(label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+        Text(text = text, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+    }
+}
+
+@Composable
+fun PlayerCircleButton(label: String, contentDesc: String, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .tvFocusableClick(RoundedCornerShape(16.dp), onClick = onClick)
+            .background(Color(0xFF1E293B))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text = label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun OsdBottomActionCard(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .width(105.dp)
+            .height(64.dp)
+            .tvFocusableClick(RoundedCornerShape(8.dp), onClick = onClick)
+            .background(Color(0xFF151A24))
+            .padding(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(icon, contentDescription = title, tint = Color.White, modifier = Modifier.size(22.dp))
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
     }
 }
 
@@ -2833,7 +3552,6 @@ fun IptvSetupScreen(
     var pass by remember { mutableStateOf(initialPass) }
     var isVerifyingPanel by remember { mutableStateOf(false) }
 
-    // Mode Admin caché : cliquez 5 fois sur le titre "Espace Client & Paramètres" pour afficher le champ URL Serveur
     var adminClicks by remember { mutableStateOf(0) }
     var customAdminServer by remember { mutableStateOf(initialServer) }
 
@@ -3057,7 +3775,7 @@ fun ChangeParentalPinDialog(
 }
 
 // =========================================================================
-// 5. MOTEUR RÉSEAU EN STREAMING (JSONREADER) ANTI-CRASH FIRE STICK 4K
+// 5. MOTEUR RÉSEAU EN STREAMING + TRI PAR ORDRE D'AJOUT DU SERVEUR (FILMS & SÉRIES)
 // =========================================================================
 
 fun downloadUrlToFile(urlStr: String, destFile: File) {
@@ -3066,7 +3784,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/7.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.0 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -3111,6 +3829,21 @@ fun JsonReader.readNextIntSafe(): Int {
         else -> {
             skipValue()
             0
+        }
+    }
+}
+
+fun JsonReader.readNextLongSafe(): Long {
+    return when (peek()) {
+        JsonToken.NUMBER -> runCatching { nextLong() }.getOrDefault(0L)
+        JsonToken.STRING -> nextString().toLongOrNull() ?: 0L
+        JsonToken.NULL -> {
+            nextNull()
+            0L
+        }
+        else -> {
+            skipValue()
+            0L
         }
     }
 }
@@ -3199,6 +3932,7 @@ suspend fun fetchXtreamLiveStreaming(
     Pair(catMap.values.toList(), list)
 }
 
+// TRI AUTOMATIQUE DES FILMS PAR ORDRE D'AJOUT DU SERVEUR (DU PLUS RÉCENT AU PLUS ANCIEN !)
 suspend fun fetchXtreamVodStreaming(
     context: Context,
     baseUrl: String,
@@ -3225,6 +3959,7 @@ suspend fun fetchXtreamVodStreaming(
                 var ext = "mp4"
                 var trailer = ""
                 var isAdultFlag = 0
+                var addedTs = 0L
 
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
@@ -3235,6 +3970,7 @@ suspend fun fetchXtreamVodStreaming(
                         "container_extension" -> ext = reader.readNextStringSafe().ifBlank { "mp4" }
                         "youtube_trailer" -> trailer = reader.readNextStringSafe()
                         "is_adult" -> isAdultFlag = reader.readNextIntSafe()
+                        "added" -> addedTs = reader.readNextLongSafe()
                         else -> reader.skipValue()
                     }
                 }
@@ -3245,15 +3981,31 @@ suspend fun fetchXtreamVodStreaming(
                     val catName = catItem?.name ?: "Cinéma"
                     val isAdult = (isAdultFlag == 1) || (catItem?.isAdult == true) || isAdultText(name)
                     val url = "$cleanBase/movie/$user/$pass/$id.$ext"
-                    list.add(MediaEntry("vod_$id", name.ifBlank { "Film $id" }, catId, catName, logo, url, "VOD", trailerId = trailer, isAdult = isAdult))
+                    val effectiveAdded = if (addedTs > 0L) addedTs else (id.toLongOrNull() ?: 0L)
+                    list.add(
+                        MediaEntry(
+                            id = "vod_$id",
+                            title = name.ifBlank { "Film $id" },
+                            categoryId = catId,
+                            categoryName = catName,
+                            logoUrl = logo,
+                            streamUrl = url,
+                            type = "VOD",
+                            trailerId = trailer,
+                            isAdult = isAdult,
+                            addedTimestamp = effectiveAdded
+                        )
+                    )
                 }
             }
             reader.endArray()
         }
     }
+    list.sortByDescending { it.addedTimestamp }
     Pair(catMap.values.toList(), list)
 }
 
+// TRI AUTOMATIQUE DES SÉRIES PAR ORDRE D'AJOUT / MODIFICATION DU SERVEUR (DE LA PLUS RÉCENTE À LA PLUS ANCIENNE !)
 suspend fun fetchXtreamSeriesStreaming(
     context: Context,
     baseUrl: String,
@@ -3278,6 +4030,7 @@ suspend fun fetchXtreamSeriesStreaming(
                 var cover = ""
                 var catId = ""
                 var trailer = ""
+                var lastModTs = 0L
 
                 while (reader.hasNext()) {
                     when (reader.nextName()) {
@@ -3286,6 +4039,7 @@ suspend fun fetchXtreamSeriesStreaming(
                         "cover" -> cover = reader.readNextStringSafe()
                         "category_id" -> catId = reader.readNextStringSafe()
                         "youtube_trailer" -> trailer = reader.readNextStringSafe()
+                        "last_modified" -> lastModTs = reader.readNextLongSafe()
                         else -> reader.skipValue()
                     }
                 }
@@ -3295,12 +4049,27 @@ suspend fun fetchXtreamSeriesStreaming(
                     val catItem = catMap[catId]
                     val catName = catItem?.name ?: "Série"
                     val isAdult = (catItem?.isAdult == true) || isAdultText(name)
-                    list.add(MediaEntry(id, name.ifBlank { "Série $id" }, catId, catName, cover, "", "SERIES", trailerId = trailer, isAdult = isAdult))
+                    val effectiveAdded = if (lastModTs > 0L) lastModTs else (id.toLongOrNull() ?: 0L)
+                    list.add(
+                        MediaEntry(
+                            id = id,
+                            title = name.ifBlank { "Série $id" },
+                            categoryId = catId,
+                            categoryName = catName,
+                            logoUrl = cover,
+                            streamUrl = "",
+                            type = "SERIES",
+                            trailerId = trailer,
+                            isAdult = isAdult,
+                            addedTimestamp = effectiveAdded
+                        )
+                    )
                 }
             }
             reader.endArray()
         }
     }
+    list.sortByDescending { it.addedTimestamp }
     Pair(catMap.values.toList(), list)
 }
 
@@ -3390,6 +4159,7 @@ suspend fun fetchSeriesEpisodesAndInfo(
     }
 }
 
+// RÉCUPÈRE TOUT L'HISTORIQUE EPG (MULTI-JOURS) POUR LE REPLAY PAR JOUR ET LE GUIDE TV
 suspend fun fetchChannelEpgList(
     baseUrl: String,
     user: String,
@@ -3398,12 +4168,15 @@ suspend fun fetchChannelEpgList(
 ): List<EpgProgram> = withContext(Dispatchers.IO) {
     try {
         val cleanBase = if (baseUrl.startsWith("http")) baseUrl else "http://$baseUrl"
+        // get_simple_data_table renvoie tous les jours archivés (Passé + Direct + Futur)
         val json = httpGet("$cleanBase/player_api.php?username=$user&password=$pass&action=get_simple_data_table&stream_id=$streamId")
         val obj = JSONObject(json)
         val arr = obj.optJSONArray("epg_listings") ?: return@withContext emptyList()
         val list = mutableListOf<EpgProgram>()
 
         val timeFormat = SimpleDateFormat("HH:mm", Locale.FRANCE)
+        val dayKeyFormat = SimpleDateFormat("yyyy-MM-dd", Locale.FRANCE)
+        val dayLabelFormat = SimpleDateFormat("EEE,\nd MMM", Locale.FRANCE)
         val dateParser = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply {
             timeZone = TimeZone.getDefault()
         }
@@ -3425,11 +4198,26 @@ suspend fun fetchChannelEpgList(
 
             val hasArchive = item.optInt("has_archive", 0) == 1
 
-            val startFormatted = if (startTs > 0) timeFormat.format(Date(startTs * 1000L)) else ""
-            val stopFormatted = if (stopTs > 0) timeFormat.format(Date(stopTs * 1000L)) else ""
+            if (title.isNotBlank() && stopTs > startTs && startTs > 0L) {
+                val startDate = Date(startTs * 1000L)
+                val startFormatted = timeFormat.format(startDate)
+                val stopFormatted = timeFormat.format(Date(stopTs * 1000L))
+                val dayKey = dayKeyFormat.format(startDate)
+                val dayLabel = dayLabelFormat.format(startDate)
 
-            if (title.isNotBlank() && stopTs > startTs) {
-                list.add(EpgProgram(title, desc, startTs, stopTs, startFormatted, stopFormatted, hasArchive))
+                list.add(
+                    EpgProgram(
+                        title = title,
+                        description = desc,
+                        startTimestamp = startTs,
+                        stopTimestamp = stopTs,
+                        startFormatted = startFormatted,
+                        stopFormatted = stopFormatted,
+                        dayKey = dayKey,
+                        dayLabel = dayLabel,
+                        hasArchive = hasArchive
+                    )
+                )
             }
         }
         list.sortedBy { it.startTimestamp }
@@ -3454,7 +4242,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/7.0 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.0 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
