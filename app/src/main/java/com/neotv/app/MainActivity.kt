@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -60,12 +61,16 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -96,7 +101,6 @@ const val REMOTE_PANEL_DEVICES_JSON = "https://raw.githubusercontent.com/sfpp-ot
 val DEFAULT_PROVIDER_URLS = listOf(
     "http://votre-serveur-principal.com:8080"
 )
-// Code secret à taper dans "Nom d'utilisateur" pour débloquer la case URL Serveur :
 const val SECRET_ADMIN_UNLOCK_CODE = "888899"
 
 class MainActivity : ComponentActivity() {
@@ -126,11 +130,21 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+// Lecteur ExoPlayer configuré avec User-Agent TiviMate/IPTV standard pour éviter tout blocage fournisseur
 @androidx.annotation.OptIn(UnstableApi::class)
 fun buildSafeExoPlayer(context: Context): ExoPlayer {
+    val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+        .setUserAgent("TiviMate/4.7.0 (Android; ExoPlayer)")
+        .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(15000)
+        .setReadTimeoutMs(30000)
+    val mediaSourceFactory = DefaultMediaSourceFactory(context)
+        .setDataSourceFactory(httpDataSourceFactory)
     val renderersFactory = DefaultRenderersFactory(context)
         .setEnableDecoderFallback(true)
-    return ExoPlayer.Builder(context, renderersFactory).build()
+    return ExoPlayer.Builder(context, renderersFactory)
+        .setMediaSourceFactory(mediaSourceFactory)
+        .build()
 }
 
 fun Modifier.tvFocusableClick(
@@ -288,6 +302,7 @@ fun openTrailerYoutube(context: Context, title: String, youtubeCode: String) {
 @Composable
 fun NeoTvApp() {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember { context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE) }
     val scope = rememberCoroutineScope()
 
@@ -350,6 +365,22 @@ fun NeoTvApp() {
     var seriesTrailer by remember { mutableStateOf("") }
     var seriesPlot by remember { mutableStateOf("") }
     var isSeriesLoading by remember { mutableStateOf(false) }
+
+    // COUPURE AUTOMATIQUE DU FLUX VIDÉO QUAND ON CLIQUE SUR LE BOUTON "HOME" DE LA TÉLÉCOMMANDE !
+    // Libère immédiatement la connexion sur le serveur du fournisseur pour éviter tout blocage d'IP.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                playingMedia = null
+                customStreamOverride = null
+                activeReplayProgram = null
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     fun runWithParentalCheck(isAdult: Boolean, action: () -> Unit) {
         if (parentalEnabled && isAdult) {
@@ -1008,6 +1039,7 @@ fun MainScreen(
             }
             1 -> {
                 TvGuideScreen(
+                    allLiveChannels = liveChannels,
                     categories = liveCategories,
                     selectedCatId = selectedCatId,
                     onSelectCategory = { catId, isAdultCat -> onChangeCategory(catId, isAdultCat) },
@@ -1198,11 +1230,12 @@ fun ParentalPinPromptDialog(
 }
 
 // =========================================================================
-// 1. GUIDE TV HORIZONTAL AVEC CRÉATION ET SUPPRESSION DE GROUPES PERSONNALISÉS
+// 1. GUIDE TV FIDÈLE À TIVIMATE : LA CHAÎNE NE CHANGE QU'AU CLIC "OK" !
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun TvGuideScreen(
+    allLiveChannels: List<MediaEntry>,
     categories: List<CategoryItem>,
     selectedCatId: String,
     onSelectCategory: (String, Boolean) -> Unit,
@@ -1215,6 +1248,7 @@ fun TvGuideScreen(
     onPlayReplayProgram: (MediaEntry, EpgProgram) -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val prefs = remember { context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE) }
 
     var customGroupNames by remember {
@@ -1259,31 +1293,67 @@ fun TvGuideScreen(
         }
     }
 
+    // SÉPARATION COMME TIVIMATE :
+    // 1. playingInMiniChannel = La chaîne qui joue dans le petit écran (ne change PAS quand on descend ou change de catégorie, uniquement quand on clique OK !)
+    // 2. focusedBrowseChannel = La chaîne sur laquelle est placé le curseur blanc (met à jour le résumé du programme à droite !)
     val lastSavedChannelId = remember { prefs.getString("last_live_channel_id", "") ?: "" }
-    var previewChannel by remember(displayedChannels) {
-        mutableStateOf(displayedChannels.firstOrNull { it.id == lastSavedChannelId } ?: displayedChannels.firstOrNull())
+    var playingInMiniChannel by remember {
+        mutableStateOf(
+            allLiveChannels.firstOrNull { it.id == lastSavedChannelId }
+                ?: displayedChannels.firstOrNull()
+        )
     }
+
+    LaunchedEffect(allLiveChannels) {
+        if (playingInMiniChannel == null && allLiveChannels.isNotEmpty()) {
+            playingInMiniChannel = allLiveChannels.firstOrNull { it.id == lastSavedChannelId }
+                ?: allLiveChannels.firstOrNull { !it.isAdult }
+        }
+    }
+
+    var focusedBrowseChannel by remember { mutableStateOf(playingInMiniChannel) }
     var highlightedProgram by remember { mutableStateOf<EpgProgram?>(null) }
 
     val miniPlayer = remember {
         buildSafeExoPlayer(context).apply { volume = 1f }
     }
 
-    LaunchedEffect(previewChannel?.id) {
-        val url = previewChannel?.streamUrl
-        if (!url.isNullOrBlank()) {
-            delay(350L)
+    LaunchedEffect(playingInMiniChannel?.id) {
+        val ch = playingInMiniChannel
+        if (ch != null && ch.streamUrl.isNotBlank()) {
+            prefs.edit().putString("last_live_channel_id", ch.id).apply()
             miniPlayer.stop()
             miniPlayer.clearMediaItems()
-            miniPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(url)))
+            miniPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(ch.streamUrl)))
             miniPlayer.prepare()
             miniPlayer.playWhenReady = true
         }
     }
 
-    DisposableEffect(Unit) {
+    // Coupe immédiatement le flux du mini-player si l'utilisateur appuie sur le bouton HOME de la TV !
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_STOP -> {
+                    miniPlayer.stop()
+                    miniPlayer.clearMediaItems()
+                }
+                Lifecycle.Event.ON_START -> {
+                    val ch = playingInMiniChannel
+                    if (ch != null && ch.streamUrl.isNotBlank() && miniPlayer.mediaItemCount == 0) {
+                        miniPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(ch.streamUrl)))
+                        miniPlayer.prepare()
+                        miniPlayer.playWhenReady = true
+                    }
+                }
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             miniPlayer.stop()
+            miniPlayer.clearMediaItems()
             miniPlayer.release()
         }
     }
@@ -1535,12 +1605,17 @@ fun TvGuideScreen(
                     .padding(horizontal = 6.dp, vertical = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                // Mini-écran : joue playingInMiniChannel sans jamais couper quand on navigue dans la liste !
                 Box(
                     modifier = Modifier
                         .width(235.dp)
                         .fillMaxHeight()
                         .tvFocusableClick(RoundedCornerShape(6.dp), onClick = {
-                            previewChannel?.let { onPlayChannelFullscreen(it) }
+                            playingInMiniChannel?.let {
+                                miniPlayer.stop()
+                                miniPlayer.clearMediaItems()
+                                onPlayChannelFullscreen(it)
+                            }
                         })
                         .background(Color.Black)
                 ) {
@@ -1556,7 +1631,9 @@ fun TvGuideScreen(
                     )
                 }
 
-                val currentChannelProgs = previewChannel?.let { epgCache[it.id] } ?: emptyList()
+                // Les informations à droite affichent le programme de la case blanche survolée (focusedBrowseChannel)
+                val infoChannel = focusedBrowseChannel ?: playingInMiniChannel
+                val currentChannelProgs = infoChannel?.let { epgCache[it.id] } ?: emptyList()
                 val activeProg = highlightedProgram
                     ?: currentChannelProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
                     ?: currentChannelProgs.firstOrNull()
@@ -1571,7 +1648,7 @@ fun TvGuideScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = activeProg?.title ?: previewChannel?.title ?: "Pas d'information",
+                            text = activeProg?.title ?: infoChannel?.title ?: "Pas d'information",
                             color = Color.White,
                             fontSize = 19.sp,
                             fontWeight = FontWeight.Bold,
@@ -1580,7 +1657,7 @@ fun TvGuideScreen(
                             modifier = Modifier.weight(1f)
                         )
                         Text(
-                            text = previewChannel?.categoryName ?: "",
+                            text = infoChannel?.categoryName ?: "",
                             color = Color(0xFF94A3B8),
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold
@@ -1621,7 +1698,7 @@ fun TvGuideScreen(
                         }
 
                         Text(
-                            text = activeProg.description.ifBlank { "Programme diffusé sur ${previewChannel?.title ?: ""}." },
+                            text = activeProg.description.ifBlank { "Programme diffusé sur ${infoChannel?.title ?: ""}." },
                             color = Color(0xFF94A3B8),
                             fontSize = 13.sp,
                             maxLines = 3,
@@ -1679,8 +1756,19 @@ fun TvGuideScreen(
                         val visibleProgs = remember(allProgs, timelineStartSec) {
                             allProgs.filter { it.stopTimestamp > timelineStartSec && it.startTimestamp < timelineEndSec }
                         }
-                        val isPlayingInMini = previewChannel?.id == ch.id
+                        val isPlayingInMini = playingInMiniChannel?.id == ch.id
                         val isFav = favorites.contains(ch.id)
+
+                        // Fonction TiviMate : 1er clic OK = Change la chaîne dans le petit écran | 2e clic OK sur la même chaîne = Plein écran !
+                        fun handleChannelClick() {
+                            if (playingInMiniChannel?.id == ch.id) {
+                                miniPlayer.stop()
+                                miniPlayer.clearMediaItems()
+                                onPlayChannelFullscreen(ch)
+                            } else {
+                                playingInMiniChannel = ch
+                            }
+                        }
 
                         Row(
                             modifier = Modifier
@@ -1697,17 +1785,11 @@ fun TvGuideScreen(
                                         RoundedCornerShape(4.dp),
                                         defaultBorderWidth = 0.dp,
                                         onFocused = {
-                                            previewChannel = ch
+                                            focusedBrowseChannel = ch
                                             highlightedProgram = visibleProgs.firstOrNull { it.startTimestamp <= nowSec && it.stopTimestamp > nowSec }
                                                 ?: visibleProgs.firstOrNull()
                                         },
-                                        onClick = {
-                                            if (previewChannel?.id == ch.id) {
-                                                onPlayChannelFullscreen(ch)
-                                            } else {
-                                                previewChannel = ch
-                                            }
-                                        }
+                                        onClick = { handleChannelClick() }
                                     )
                                     .padding(horizontal = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -1791,13 +1873,10 @@ fun TvGuideScreen(
                                                 .tiviGuideCellFocus(
                                                     isCurrentBroadcast = slotIdx == 0,
                                                     onFocused = {
-                                                        previewChannel = ch
+                                                        focusedBrowseChannel = ch
                                                         highlightedProgram = null
                                                     },
-                                                    onClick = {
-                                                        if (previewChannel?.id == ch.id) onPlayChannelFullscreen(ch)
-                                                        else previewChannel = ch
-                                                    }
+                                                    onClick = { handleChannelClick() }
                                                 )
                                                 .padding(horizontal = 10.dp),
                                             contentAlignment = Alignment.CenterStart
@@ -1831,15 +1910,17 @@ fun TvGuideScreen(
                                                 .tiviGuideCellFocus(
                                                     isCurrentBroadcast = isCurrent,
                                                     onFocused = {
-                                                        previewChannel = ch
+                                                        focusedBrowseChannel = ch
                                                         highlightedProgram = prog
                                                     },
                                                     onClick = {
                                                         highlightedProgram = prog
-                                                        when {
-                                                            canReplay -> onPlayReplayProgram(ch, prog)
-                                                            previewChannel?.id == ch.id -> onPlayChannelFullscreen(ch)
-                                                            else -> previewChannel = ch
+                                                        if (canReplay) {
+                                                            miniPlayer.stop()
+                                                            miniPlayer.clearMediaItems()
+                                                            onPlayReplayProgram(ch, prog)
+                                                        } else {
+                                                            handleChannelClick()
                                                         }
                                                     }
                                                 )
@@ -1962,7 +2043,9 @@ fun TvActionButton(
     }
 }
 
-@androidx.annotation.OptIn(UnstableApi::class)
+// =========================================================================
+// 2. FICHES FILMS & SÉRIES SANS CONNEXION PARALLÈLE (PROTÈGE L'IP DU SERVEUR !)
+// =========================================================================
 @Composable
 fun MovieDetailScreen(
     movie: MediaEntry,
@@ -1977,30 +2060,15 @@ fun MovieDetailScreen(
     onBack: () -> Unit
 ) {
     BackHandler { onBack() }
-    val context = LocalContext.current
-    var isMuted by remember { mutableStateOf(false) }
     val playButtonFocusRequester = remember { FocusRequester() }
 
-    val previewPlayer = remember {
-        buildSafeExoPlayer(context).apply {
-            setMediaItem(MediaItem.fromUri(Uri.parse(movie.streamUrl)))
-            prepare()
-            seekTo(480_000L)
-            playWhenReady = true
-            volume = 0.8f
-        }
-    }
-
     LaunchedEffect(Unit) {
-        delay(150L)
+        delay(120L)
         runCatching { playButtonFocusRequester.requestFocus() }
     }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            previewPlayer.stop()
-            previewPlayer.release()
-        }
+    val backdropImage = remember(details, movie) {
+        details?.backdropUrl?.ifBlank { movie.logoUrl } ?: movie.logoUrl
     }
 
     Box(
@@ -2008,16 +2076,14 @@ fun MovieDetailScreen(
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        AndroidView(
-            factory = { ctx ->
-                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                    player = previewPlayer
-                    useController = false
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
+        if (backdropImage.isNotBlank()) {
+            AsyncImage(
+                model = backdropImage,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
 
         Box(
             modifier = Modifier
@@ -2025,10 +2091,9 @@ fun MovieDetailScreen(
                 .background(
                     Brush.horizontalGradient(
                         0.00f to Color(0xFF0B0E14),
-                        0.28f to Color(0xFF0B0E14),
-                        0.50f to Color(0xCC0B0E14),
-                        0.75f to Color(0x440B0E14),
-                        1.00f to Color.Transparent
+                        0.32f to Color(0xEE0B0E14),
+                        0.60f to Color(0xCC0B0E14),
+                        1.00f to Color(0x550B0E14)
                     )
                 )
         )
@@ -2038,11 +2103,9 @@ fun MovieDetailScreen(
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
-                        0.00f to Color(0x660B0E14),
-                        0.20f to Color.Transparent,
-                        0.45f to Color(0x660B0E14),
-                        0.62f to Color(0xDD0B0E14),
-                        0.74f to Color(0xFF0B0E14),
+                        0.00f to Color(0x880B0E14),
+                        0.30f to Color(0x440B0E14),
+                        0.65f to Color(0xEE0B0E14),
                         1.00f to Color(0xFF0B0E14)
                     )
                 )
@@ -2070,37 +2133,18 @@ fun MovieDetailScreen(
                         Icon(Icons.Default.ArrowBack, contentDescription = "Retour", tint = Color.White)
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(
-                            modifier = Modifier
-                                .size(42.dp)
-                                .tvFocusableClick(CircleShape, onClick = {
-                                    isMuted = !isMuted
-                                    previewPlayer.volume = if (isMuted) 0f else 1f
-                                })
-                                .background(Color(0xAA151A24)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (isMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
-                                contentDescription = "Son extrait",
-                                tint = Color.White
-                            )
-                        }
-
-                        Box(
-                            modifier = Modifier
-                                .size(42.dp)
-                                .tvFocusableClick(CircleShape, onClick = onToggleFav)
-                                .background(Color(0xAA151A24)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
-                                contentDescription = "Favori",
-                                tint = if (isFavorite) Color(0xFFFACC15) else Color.White
-                            )
-                        }
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .tvFocusableClick(CircleShape, onClick = onToggleFav)
+                            .background(Color(0xAA151A24)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarBorder,
+                            contentDescription = "Favori",
+                            tint = if (isFavorite) Color(0xFFFACC15) else Color.White
+                        )
                     }
                 }
             }
@@ -2151,18 +2195,6 @@ fun MovieDetailScreen(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    TvActionButton(
-                        text = if (savedPositionMs > 10000L) "Depuis le début" else "Lecture",
-                        icon = Icons.Default.PlayArrow,
-                        baseBgColor = Color.White,
-                        baseContentColor = Color.Black,
-                        modifier = Modifier.focusRequester(playButtonFocusRequester),
-                        onClick = {
-                            previewPlayer.pause()
-                            onPlayFromStart()
-                        }
-                    )
-
                     if (savedPositionMs > 10000L) {
                         val min = (savedPositionMs / 60000).toInt()
                         TvActionButton(
@@ -2170,10 +2202,24 @@ fun MovieDetailScreen(
                             icon = Icons.Default.PlayArrow,
                             baseBgColor = Color(0xFF8B5CF6),
                             baseContentColor = Color.White,
-                            onClick = {
-                                previewPlayer.pause()
-                                onResumePlay()
-                            }
+                            modifier = Modifier.focusRequester(playButtonFocusRequester),
+                            onClick = onResumePlay
+                        )
+                        TvActionButton(
+                            text = "Depuis le début",
+                            icon = Icons.Default.Refresh,
+                            baseBgColor = Color.White,
+                            baseContentColor = Color.Black,
+                            onClick = onPlayFromStart
+                        )
+                    } else {
+                        TvActionButton(
+                            text = "Regarder",
+                            icon = Icons.Default.PlayArrow,
+                            baseBgColor = Color.White,
+                            baseContentColor = Color.Black,
+                            modifier = Modifier.focusRequester(playButtonFocusRequester),
+                            onClick = onPlayFromStart
                         )
                     }
 
@@ -2182,10 +2228,7 @@ fun MovieDetailScreen(
                         icon = Icons.Default.Movie,
                         baseBgColor = Color(0xFFDC2626),
                         baseContentColor = Color.White,
-                        onClick = {
-                            previewPlayer.pause()
-                            onWatchTrailer()
-                        }
+                        onClick = onWatchTrailer
                     )
                 }
             }
@@ -2221,7 +2264,6 @@ fun MovieDetailScreen(
     }
 }
 
-@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun SeriesDetailScreen(
     series: MediaEntry,
@@ -2237,7 +2279,6 @@ fun SeriesDetailScreen(
     onPlayEpisode: (EpisodeItem) -> Unit
 ) {
     BackHandler { onBack() }
-    val context = LocalContext.current
     var selectedSeason by remember { mutableStateOf<Int?>(null) }
     val seasons = remember(episodes) { episodes.map { it.season }.distinct().sorted() }
 
@@ -2248,71 +2289,27 @@ fun SeriesDetailScreen(
         }
     }
 
-    val previewPlayer = remember {
-        buildSafeExoPlayer(context).apply {
-            volume = 0.6f
-        }
-    }
-
-    LaunchedEffect(episodes.firstOrNull()?.streamUrl) {
-        val firstUrl = episodes.firstOrNull()?.streamUrl
-        if (!firstUrl.isNullOrBlank()) {
-            previewPlayer.stop()
-            previewPlayer.clearMediaItems()
-            previewPlayer.setMediaItem(MediaItem.fromUri(Uri.parse(firstUrl)))
-            previewPlayer.prepare()
-            previewPlayer.seekTo(180_000L)
-            previewPlayer.playWhenReady = true
-        }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            previewPlayer.stop()
-            previewPlayer.release()
-        }
-    }
-
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF0B0E14))
     ) {
-        AndroidView(
-            factory = { ctx ->
-                (LayoutInflater.from(ctx).inflate(R.layout.texture_player_view, null) as PlayerView).apply {
-                    player = previewPlayer
-                    useController = false
-                    resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                }
-            },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        0.00f to Color(0xFF0B0E14),
-                        0.28f to Color(0xFF0B0E14),
-                        0.50f to Color(0xCC0B0E14),
-                        0.75f to Color(0x440B0E14),
-                        1.00f to Color.Transparent
-                    )
-                )
-        )
+        if (series.logoUrl.isNotBlank()) {
+            AsyncImage(
+                model = series.logoUrl,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
 
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(
                     Brush.verticalGradient(
-                        0.00f to Color(0x660B0E14),
-                        0.20f to Color.Transparent,
-                        0.45f to Color(0x660B0E14),
-                        0.62f to Color(0xDD0B0E14),
-                        0.74f to Color(0xFF0B0E14),
+                        0.00f to Color(0xCC0B0E14),
+                        0.40f to Color(0xEE0B0E14),
                         1.00f to Color(0xFF0B0E14)
                     )
                 )
@@ -2355,10 +2352,7 @@ fun SeriesDetailScreen(
                             icon = Icons.Default.PlayArrow,
                             baseBgColor = Color(0xFF8B5CF6),
                             baseContentColor = Color.White,
-                            onClick = {
-                                previewPlayer.pause()
-                                onPlayEpisode(resumeEp)
-                            }
+                            onClick = { onPlayEpisode(resumeEp) }
                         )
                     }
 
@@ -2367,10 +2361,7 @@ fun SeriesDetailScreen(
                         icon = Icons.Default.Movie,
                         baseBgColor = Color(0xFFDC2626),
                         baseContentColor = Color.White,
-                        onClick = {
-                            previewPlayer.pause()
-                            onWatchTrailer()
-                        }
+                        onClick = onWatchTrailer
                     )
 
                     Box(
@@ -2417,10 +2408,7 @@ fun SeriesDetailScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .tvFocusableClick(RoundedCornerShape(10.dp), onClick = {
-                                    previewPlayer.pause()
-                                    onPlayEpisode(ep)
-                                })
+                                .tvFocusableClick(RoundedCornerShape(10.dp), onClick = { onPlayEpisode(ep) })
                                 .background(if (isLastPlayed) Color(0xFF1E1B4B) else Color(0xFF151A24))
                                 .padding(14.dp)
                         ) {
@@ -2631,7 +2619,7 @@ fun HomeDashboard(
     }
 }
 // =========================================================================
-// 3. LECTEUR VIDÉO PLEIN ÉCRAN AVEC BARRE D'AVANCEMENT INTERACTIVE ET NAVIGATION FIRE STICK 100% FLUIDE
+// 3. LECTEUR VIDÉO PLEIN ÉCRAN STYLE TIVIMATE (SEEK DIFFÉRÉ ANTI-BAN IP + ZAPPING HAUT/BAS + TIMESHIFT BIDIRECTIONNEL)
 // =========================================================================
 @androidx.annotation.OptIn(UnstableApi::class)
 @Composable
@@ -2657,6 +2645,7 @@ fun UltimateVideoPlayerScreen(
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     var osdVisible by remember { mutableStateOf(true) }
     var interactionTick by remember { mutableStateOf(0) }
@@ -2671,10 +2660,15 @@ fun UltimateVideoPlayerScreen(
         AspectRatioFrameLayout.RESIZE_MODE_FILL to "Étiré 16:9"
     )
 
-    var liveTimeshiftOffsetSec by remember(media.id, streamUrlToPlay) { mutableStateOf(0L) }
-    var activeUrl by remember(streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
+    // Décalage Timeshift validé (en secondes, négatif quand on est dans le passé sur une chaîne en direct)
+    var liveTimeshiftOffsetSec by remember(media.id) { mutableStateOf(0L) }
+    var activeUrl by remember(media.id, streamUrlToPlay) { mutableStateOf(streamUrlToPlay) }
     var isPausedState by remember { mutableStateOf(false) }
     var isSeekBarFocused by remember { mutableStateOf(false) }
+
+    // SEEK DIFFÉRÉ STYLE TIVIMATE (Empêche d'envoyer 30 requêtes/seconde au serveur pendant qu'on maintient Gauche/Droite !)
+    var pendingSeekDeltaSec by remember(media.id, activeUrl) { mutableStateOf(0L) }
+    var seekCommitTick by remember { mutableStateOf(0) }
 
     val primaryOsdFocusRequester = remember { FocusRequester() }
     val backgroundPlayerFocusRequester = remember { FocusRequester() }
@@ -2690,7 +2684,9 @@ fun UltimateVideoPlayerScreen(
                 runCatching { primaryOsdFocusRequester.requestFocus() }
             }
             delay(6500L)
-            osdVisible = false
+            if (pendingSeekDeltaSec == 0L) {
+                osdVisible = false
+            }
         } else if (!osdVisible && !showLeftReplayDrawer && !showTracksDialog) {
             delay(80L)
             runCatching { backgroundPlayerFocusRequester.requestFocus() }
@@ -2734,12 +2730,25 @@ fun UltimateVideoPlayerScreen(
         }
     }
 
-    DisposableEffect(Unit) {
+    // Coupe immédiatement le flux vidéo quand on appuie sur le bouton HOME de la télécommande !
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                if (media.type != "LIVE") {
+                    onSaveProgress(exoPlayer.currentPosition, exoPlayer.duration)
+                }
+                exoPlayer.stop()
+                exoPlayer.clearMediaItems()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
             if (media.type != "LIVE") {
                 onSaveProgress(exoPlayer.currentPosition, exoPlayer.duration)
             }
             exoPlayer.stop()
+            exoPlayer.clearMediaItems()
             exoPlayer.release()
         }
     }
@@ -2763,26 +2772,66 @@ fun UltimateVideoPlayerScreen(
         else epgList.firstOrNull { it.startTimestamp >= currentEpg.stopTimestamp }
     }
 
-    fun jumpBySeconds(deltaSec: Long) {
-        wakeUpOsd()
-        if (media.type != "LIVE" || isReplayMode || exoPlayer.isCurrentMediaItemSeekable) {
-            val dur = exoPlayer.duration.let { if (it > 0L) it else Long.MAX_VALUE }
-            val target = (exoPlayer.currentPosition + deltaSec * 1000L).coerceIn(0L, dur)
-            exoPlayer.seekTo(target)
-            currentPosMs = target
-        } else if (media.tvArchive == 1 && serverUrl.isNotBlank()) {
-            val progStart = currentEpg?.startTimestamp ?: (nowSec - 3600L)
-            val maxBackSec = (nowSec - progStart).coerceAtLeast(3600L)
-            liveTimeshiftOffsetSec = (liveTimeshiftOffsetSec + deltaSec).coerceIn(-maxBackSec, 0L)
-            if (liveTimeshiftOffsetSec < -10L) {
-                val targetUnixSec = nowSec + liveTimeshiftOffsetSec
-                activeUrl = buildCatchupUrl(serverUrl, username, password, media.id, targetUnixSec, targetUnixSec + 7200L)
-            } else {
-                liveTimeshiftOffsetSec = 0L
-                activeUrl = media.streamUrl
-                onReturnToLive()
+    // Exécute UNE SEULE requête réseau 650ms après le dernier appui sur Gauche/Droite (Comme TiviMate à 02:36 !)
+    LaunchedEffect(seekCommitTick) {
+        if (seekCommitTick > 0 && pendingSeekDeltaSec != 0L) {
+            delay(650L)
+            val deltaToApply = pendingSeekDeltaSec
+            pendingSeekDeltaSec = 0L
+
+            if (media.type != "LIVE" || isReplayMode) {
+                val dur = exoPlayer.duration.let { if (it > 0L) it else Long.MAX_VALUE }
+                val targetMs = (exoPlayer.currentPosition + deltaToApply * 1000L).coerceIn(0L, dur)
+                exoPlayer.seekTo(targetMs)
+                currentPosMs = targetMs
+            } else if (media.tvArchive == 1 && serverUrl.isNotBlank()) {
+                val progStart = currentEpg?.startTimestamp ?: (nowSec - 7200L)
+                val maxBackSec = (nowSec - progStart).coerceAtLeast(7200L)
+                val newOffsetSec = (liveTimeshiftOffsetSec + deltaToApply).coerceIn(-maxBackSec, 0L)
+                liveTimeshiftOffsetSec = newOffsetSec
+
+                if (newOffsetSec < -10L) {
+                    val targetUnixSec = (System.currentTimeMillis() / 1000L) + newOffsetSec
+                    activeUrl = buildCatchupUrl(serverUrl, username, password, media.id, targetUnixSec, targetUnixSec + 7200L)
+                } else {
+                    liveTimeshiftOffsetSec = 0L
+                    activeUrl = media.streamUrl
+                    onReturnToLive()
+                }
             }
         }
+    }
+
+    // Fonction appelée quand on clique sur Gauche/Droite sur la barre ou sur les boutons -5m / -1m / +1m / +5m
+    fun queueSmoothSeek(stepSeconds: Long) {
+        wakeUpOsd()
+        if (media.type != "LIVE" || isReplayMode) {
+            val durSec = (totalDurMs / 1000L).coerceAtLeast(1L)
+            val curSec = currentPosMs / 1000L
+            val nextDelta = (pendingSeekDeltaSec + stepSeconds).coerceIn(-curSec, durSec - curSec)
+            pendingSeekDeltaSec = nextDelta
+            seekCommitTick++
+        } else if (media.tvArchive == 1) {
+            val progStart = currentEpg?.startTimestamp ?: (nowSec - 7200L)
+            val maxBackSec = (nowSec - progStart).coerceAtLeast(7200L)
+            // Permet de reculer ET d'avancer à nouveau jusqu'à 0 (le Direct) !
+            val minAllowedDelta = -maxBackSec - liveTimeshiftOffsetSec
+            val maxAllowedDelta = -liveTimeshiftOffsetSec // Permet de remonter jusqu'au Direct (0s)
+            pendingSeekDeltaSec = (pendingSeekDeltaSec + stepSeconds).coerceIn(minAllowedDelta, maxAllowedDelta)
+            seekCommitTick++
+        }
+    }
+
+    // Zapping direct en plein écran avec Flèche Haut / Flèche Bas (comme sur TiviMate à 01:42 !)
+    fun zapChannelUpOrDown(direction: Int) {
+        if (liveChannelList.isEmpty()) return
+        val currentIndex = liveChannelList.indexOfFirst { it.id == media.id }
+        val nextIndex = if (currentIndex == -1) {
+            0
+        } else {
+            (currentIndex + direction + liveChannelList.size) % liveChannelList.size
+        }
+        onSwitchChannel(liveChannelList[nextIndex])
     }
 
     val dateTopRight = remember(nowSec) {
@@ -2802,9 +2851,24 @@ fun UltimateVideoPlayerScreen(
                 .onKeyEvent { event ->
                     if (!osdVisible && !showLeftReplayDrawer && event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
                         when (event.nativeKeyEvent.keyCode) {
-                            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER,
-                            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> {
                                 wakeUpOsd()
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                                if (media.type == "LIVE" && liveChannelList.size > 1) {
+                                    zapChannelUpOrDown(+1) // Chaîne suivante !
+                                } else {
+                                    wakeUpOsd()
+                                }
+                                true
+                            }
+                            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_CHANNEL_UP -> {
+                                if (media.type == "LIVE" && liveChannelList.size > 1) {
+                                    zapChannelUpOrDown(-1) // Chaîne précédente !
+                                } else {
+                                    wakeUpOsd()
+                                }
                                 true
                             }
                             KeyEvent.KEYCODE_DPAD_LEFT -> {
@@ -2935,7 +2999,8 @@ fun UltimateVideoPlayerScreen(
                         ) {
                             if (currentEpg != null) {
                                 val totalDurSec = (currentEpg.stopTimestamp - currentEpg.startTimestamp).coerceAtLeast(1L)
-                                val elapsedSec = (nowSec + liveTimeshiftOffsetSec - currentEpg.startTimestamp).coerceIn(0L, totalDurSec)
+                                val effectiveOffset = liveTimeshiftOffsetSec + pendingSeekDeltaSec
+                                val elapsedSec = (nowSec + effectiveOffset - currentEpg.startTimestamp).coerceIn(0L, totalDurSec)
                                 val frac = elapsedSec.toFloat() / totalDurSec.toFloat()
                                 val remainMin = ((currentEpg.stopTimestamp - nowSec) / 60L).coerceAtLeast(0L)
 
@@ -2982,27 +3047,38 @@ fun UltimateVideoPlayerScreen(
                     }
                 }
 
-                val progDurationSec = if (currentEpg != null) {
+                // CALCUL DE LA BARRE D'AVANCEMENT EN TEMPS RÉEL AVEC APERÇU IMMÉDIAT DU DÉPLACEMENT
+                val progDurationSec = if (media.type == "LIVE" && !isReplayMode && currentEpg != null) {
                     (currentEpg.stopTimestamp - currentEpg.startTimestamp).coerceAtLeast(60L)
                 } else {
                     (totalDurMs / 1000L).coerceAtLeast(60L)
                 }
+
                 val progElapsedSec = if (media.type == "LIVE" && !isReplayMode && currentEpg != null) {
-                    ((nowSec - currentEpg.startTimestamp) + liveTimeshiftOffsetSec).coerceIn(0L, progDurationSec)
+                    ((nowSec - currentEpg.startTimestamp) + liveTimeshiftOffsetSec + pendingSeekDeltaSec).coerceIn(0L, progDurationSec)
                 } else {
-                    (currentPosMs / 1000L).coerceIn(0L, progDurationSec)
+                    ((currentPosMs / 1000L) + pendingSeekDeltaSec).coerceIn(0L, progDurationSec)
                 }
+
                 val barFraction = (progElapsedSec.toFloat() / progDurationSec.toFloat()).coerceIn(0f, 1f)
 
                 val elapsedMinStr = String.format("%02d:%02d", progElapsedSec / 60, progElapsedSec % 60)
                 val totalMinStr = String.format("%02d:%02d", progDurationSec / 60, progDurationSec % 60)
-                val offsetMinStr = if (liveTimeshiftOffsetSec < 0L) {
-                    val absSec = kotlin.math.abs(liveTimeshiftOffsetSec)
-                    String.format(" [-%02d:%02d]", absSec / 60, absSec % 60)
+
+                val displayDeltaSec = if (pendingSeekDeltaSec != 0L) {
+                    pendingSeekDeltaSec
+                } else if (media.type == "LIVE" && liveTimeshiftOffsetSec < 0L) {
+                    liveTimeshiftOffsetSec
+                } else 0L
+
+                val offsetBadgeStr = if (displayDeltaSec != 0L) {
+                    val sign = if (displayDeltaSec > 0L) "+" else "-"
+                    val absSec = kotlin.math.abs(displayDeltaSec)
+                    String.format(" [%s%02d:%02d]", sign, absSec / 60, absSec % 60)
                 } else ""
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    val stepSec = if (media.type == "LIVE") 60L else 30L
+                    val stepSec = if (media.type == "LIVE") 60L else 60L
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -3023,11 +3099,11 @@ fun UltimateVideoPlayerScreen(
                                 if (event.nativeKeyEvent.action == KeyEvent.ACTION_DOWN) {
                                     when (event.nativeKeyEvent.keyCode) {
                                         KeyEvent.KEYCODE_DPAD_LEFT -> {
-                                            jumpBySeconds(-stepSec)
+                                            queueSmoothSeek(-stepSec)
                                             true
                                         }
                                         KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                                            jumpBySeconds(stepSec)
+                                            queueSmoothSeek(+stepSec)
                                             true
                                         }
                                         else -> false
@@ -3055,14 +3131,14 @@ fun UltimateVideoPlayerScreen(
                     ) {
                         Column {
                             Text(
-                                text = "$elapsedMinStr / $totalMinStr$offsetMinStr",
-                                color = Color.White,
+                                text = "$elapsedMinStr / $totalMinStr$offsetBadgeStr",
+                                color = if (pendingSeekDeltaSec != 0L) Color(0xFF38BDF8) else Color.White,
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             if (isSeekBarFocused) {
                                 Text(
-                                    text = "◀ ▶ Flèches Gauche/Droite pour reculer ou avancer",
+                                    text = "◀ ▶ Maintenez Gauche/Droite pour déplacer le curseur sans couper le serveur",
                                     color = Color(0xFF38BDF8),
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.SemiBold
@@ -3077,14 +3153,15 @@ fun UltimateVideoPlayerScreen(
                             PlayerCircleButton("⏮ Début", "Début") {
                                 if (media.type == "LIVE" && currentEpg != null) {
                                     val backToStart = currentEpg.startTimestamp - nowSec
-                                    jumpBySeconds(backToStart - liveTimeshiftOffsetSec)
+                                    queueSmoothSeek(backToStart - liveTimeshiftOffsetSec)
                                 } else {
+                                    pendingSeekDeltaSec = 0L
                                     exoPlayer.seekTo(0L)
                                     currentPosMs = 0L
                                 }
                             }
-                            PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
-                            PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
+                            PlayerCircleButton("⏪ 5m", "-5 min") { queueSmoothSeek(-300L) }
+                            PlayerCircleButton("⏪ 1m", "-1 min") { queueSmoothSeek(-60L) }
 
                             var isPlayFocused by remember { mutableStateOf(false) }
                             Box(
@@ -3125,8 +3202,8 @@ fun UltimateVideoPlayerScreen(
                                 )
                             }
 
-                            PlayerCircleButton("1m ⏩", "+1 min") { jumpBySeconds(60L) }
-                            PlayerCircleButton("5m ⏩", "+5 min") { jumpBySeconds(300L) }
+                            PlayerCircleButton("1m ⏩", "+1 min") { queueSmoothSeek(+60L) }
+                            PlayerCircleButton("5m ⏩", "+5 min") { queueSmoothSeek(+300L) }
                         }
 
                         Row(
@@ -3146,6 +3223,7 @@ fun UltimateVideoPlayerScreen(
                                     isHighlighted = isBehindLive
                                 ) {
                                     wakeUpOsd()
+                                    pendingSeekDeltaSec = 0L
                                     liveTimeshiftOffsetSec = 0L
                                     activeUrl = media.streamUrl
                                     onReturnToLive()
@@ -3917,7 +3995,6 @@ fun IptvSetupScreen(
             )
         }
 
-        // BLOC 1 : ACTIVATION À DISTANCE PAR ADRESSE MAC & CLÉ D'APPAREIL (ZÉRO SAISIE POUR LE CLIENT !)
         item {
             Column(
                 modifier = Modifier
@@ -4008,7 +4085,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC 2 : CONNEXION MANUELLE (Nom d'utilisateur & Mot de passe + Code secret 888899)
         item {
             Column(
                 modifier = Modifier
@@ -4092,7 +4168,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC 3 : INFORMATIONS D'ABONNEMENT
         item {
             Column(
                 modifier = Modifier
@@ -4110,7 +4185,6 @@ fun IptvSetupScreen(
             }
         }
 
-        // BLOC 4 : CONTRÔLE PARENTAL
         item {
             Column(
                 modifier = Modifier
@@ -4212,7 +4286,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/8.3 (ExoPlayer)")
+        setRequestProperty("User-Agent", "TiviMate/4.7.0 (Android; ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -4666,7 +4740,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/8.3 (ExoPlayer)")
+        setRequestProperty("User-Agent", "TiviMate/4.7.0 (Android; ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
