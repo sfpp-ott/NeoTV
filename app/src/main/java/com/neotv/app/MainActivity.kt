@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonToken
@@ -81,15 +82,17 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
 // =========================================================================
-// CONFIGURATION DU PANEL D'URLS À DISTANCE & CODE SECRET ADMIN
+// CONFIGURATION DES PANELS À DISTANCE & CODE SECRET ADMIN
 // =========================================================================
 const val REMOTE_PANEL_URLS_JSON = "https://raw.githubusercontent.com/sfpp-ott/NeoTV/main/panel_urls.json"
+const val REMOTE_PANEL_DEVICES_JSON = "https://raw.githubusercontent.com/sfpp-ott/NeoTV/main/panel_devices.json"
 val DEFAULT_PROVIDER_URLS = listOf(
     "http://votre-serveur-principal.com:8080"
 )
@@ -185,6 +188,17 @@ fun isAdultText(text: String): Boolean {
     )
     return adultKeywords.any { lower.contains(it) }
 }
+
+data class DeviceIdentity(
+    val macAddress: String,
+    val deviceKey: String
+)
+
+data class RemoteDeviceConfig(
+    val server: String,
+    val user: String,
+    val pass: String
+)
 
 data class MediaEntry(
     val id: String,
@@ -382,7 +396,31 @@ fun NeoTvApp() {
     }
 
     fun loadAllXtreamData(forceRefresh: Boolean = false) {
-        if (username.isBlank()) return
+        if (username.isBlank()) {
+            scope.launch {
+                val dev = getOrCreateDeviceIdentity(context)
+                val remote = fetchRemoteDeviceActivation(dev.macAddress, dev.deviceKey)
+                if (remote != null) {
+                    val resolvedUrl = if (remote.server.isNotBlank()) {
+                        remote.server
+                    } else {
+                        resolveAuthorizedServerForUser(remote.user, remote.pass, "")
+                    }
+                    serverUrl = resolvedUrl
+                    username = remote.user
+                    password = remote.pass
+                    prefs.edit()
+                        .putString("server", serverUrl)
+                        .putString("user", username)
+                        .putString("pass", password)
+                        .apply()
+                    loadAllXtreamData(forceRefresh = true)
+                } else {
+                    showSettings = true
+                }
+            }
+            return
+        }
         isLoading = true
         errorMsg = null
         scope.launch {
@@ -871,7 +909,7 @@ fun MainScreen(
                         .padding(horizontal = 12.dp, vertical = 6.dp)
                 ) {
                     Text(
-                        text = if (liveChannels.isEmpty()) "Connexion" else "Exp: ${accountInfo.expDateFormatted}",
+                        text = if (liveChannels.isEmpty()) "Activation / Compte" else "Exp: ${accountInfo.expDateFormatted}",
                         color = Color.White,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
@@ -1289,7 +1327,6 @@ fun TvGuideScreen(
         )
     }
 
-    // Fenêtre de confirmation de suppression d'un groupe créé par erreur
     if (groupToDeleteConfirm != null) {
         val gName = groupToDeleteConfirm!!
         AlertDialog(
@@ -1369,7 +1406,6 @@ fun TvGuideScreen(
                                     fontWeight = FontWeight.Bold
                                 )
                             }
-                            // Bouton Corbeille pour supprimer ce groupe directement depuis la fenêtre
                             Box(
                                 modifier = Modifier
                                     .size(44.dp)
@@ -1448,7 +1484,6 @@ fun TvGuideScreen(
                 item {
                     CategoryRowItem("Favoris (${favorites.size})", selectedCatId == "FAV") { onSelectCategory("FAV", false) }
                 }
-                // Groupes personnalisés avec bouton Corbeille 🗑️ à droite pour les supprimer en 1 clic !
                 items(customGroupNames.toList()) { gName ->
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -2759,7 +2794,6 @@ fun UltimateVideoPlayerScreen(
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Zone vidéo plein écran (ne bloque jamais les flèches quand l'OSD est affiché !)
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -2967,7 +3001,6 @@ fun UltimateVideoPlayerScreen(
                     String.format(" [-%02d:%02d]", absSec / 60, absSec % 60)
                 } else ""
 
-                // BARRE D'AVANCEMENT INTERACTIVE (Utilisez Gauche / Droite directement sur la barre pour reculer/avancer !)
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     val stepSec = if (media.type == "LIVE") 60L else 30L
                     Box(
@@ -3015,7 +3048,6 @@ fun UltimateVideoPlayerScreen(
                         )
                     }
 
-                    // RANGÉE DE CONTRÔLES LECTEUR (TOUJOURS ACCESSIBLE AVEC LES FLÈCHES DU FIRE STICK !)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -3054,7 +3086,6 @@ fun UltimateVideoPlayerScreen(
                             PlayerCircleButton("⏪ 5m", "-5 min") { jumpBySeconds(-300L) }
                             PlayerCircleButton("⏪ 1m", "-1 min") { jumpBySeconds(-60L) }
 
-                            // Bouton Play/Pause (reçoit le focus automatique sur les Films/Séries !)
                             var isPlayFocused by remember { mutableStateOf(false) }
                             Box(
                                 modifier = Modifier
@@ -3124,7 +3155,6 @@ fun UltimateVideoPlayerScreen(
                     }
                 }
 
-                // RANGÉE DU BAS EN DIRECT : Guide TV | Replay / Jours | Cartes des chaînes récentes
                 if (media.type == "LIVE") {
                     LazyRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -3746,8 +3776,62 @@ fun CategoryChip(label: String, isSelected: Boolean, onClick: () -> Unit) {
 }
 
 // =========================================================================
-// 4. ESPACE CLIENT VERROUILLÉ PAR PANEL D'URLS + CODE SECRET ADMIN (888899)
+// 4. IDENTITÉ D'APPAREIL (ADRESSE MAC & CLÉ 6 CHIFFRES) + ACTIVATION À DISTANCE
 // =========================================================================
+fun getOrCreateDeviceIdentity(context: Context): DeviceIdentity {
+    val prefs = context.getSharedPreferences("neotv_pro_prefs", Context.MODE_PRIVATE)
+    val savedMac = prefs.getString("device_mac", null)
+    val savedKey = prefs.getString("device_key", null)
+    if (!savedMac.isNullOrBlank() && !savedKey.isNullOrBlank()) {
+        return DeviceIdentity(savedMac, savedKey)
+    }
+
+    val androidId = try {
+        Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID) ?: "neotv_default"
+    } catch (_: Exception) {
+        "neotv_fallback"
+    }
+
+    val hash = MessageDigest.getInstance("MD5").digest(androidId.toByteArray())
+    val b3 = String.format("%02X", hash[0])
+    val b4 = String.format("%02X", hash[1])
+    val b5 = String.format("%02X", hash[2])
+    val mac = "00:1A:79:$b3:$b4:$b5"
+
+    val keyNum = ((hash[3].toInt() and 0xFF) * 65536 + (hash[4].toInt() and 0xFF) * 256 + (hash[5].toInt() and 0xFF)) % 900000 + 100000
+    val key = keyNum.toString()
+
+    prefs.edit()
+        .putString("device_mac", mac)
+        .putString("device_key", key)
+        .apply()
+
+    return DeviceIdentity(mac, key)
+}
+
+suspend fun fetchRemoteDeviceActivation(mac: String, key: String): RemoteDeviceConfig? = withContext(Dispatchers.IO) {
+    try {
+        val raw = httpGet("$REMOTE_PANEL_DEVICES_JSON?t=${System.currentTimeMillis()}")
+        val arr = JSONArray(raw)
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val itemMac = obj.optString("mac", "").trim().uppercase(Locale.ROOT)
+            val itemKey = obj.optString("key", "").trim()
+            if (itemMac == mac.uppercase(Locale.ROOT) && (itemKey.isEmpty() || itemKey == key)) {
+                val srv = obj.optString("server", "").trim().removeSuffix("/")
+                val usr = obj.optString("user", "").trim()
+                val pwd = obj.optString("pass", "").trim()
+                if (usr.isNotBlank() && pwd.isNotBlank()) {
+                    return@withContext RemoteDeviceConfig(srv, usr, pwd)
+                }
+            }
+        }
+        null
+    } catch (_: Exception) {
+        null
+    }
+}
+
 suspend fun resolveAuthorizedServerForUser(user: String, pass: String, fallbackServer: String): String = withContext(Dispatchers.IO) {
     val candidateUrls = mutableListOf<String>()
     try {
@@ -3790,12 +3874,15 @@ fun IptvSetupScreen(
     onCancel: () -> Unit
 ) {
     BackHandler { onCancel() }
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val deviceIdentity = remember { getOrCreateDeviceIdentity(context) }
+
     var user by remember { mutableStateOf(initialUser) }
     var pass by remember { mutableStateOf(initialPass) }
     var isVerifyingPanel by remember { mutableStateOf(false) }
+    var activationStatusMsg by remember { mutableStateOf<String?>(null) }
 
-    // Déverrouillage sécurisé uniquement par code secret (888899) tapé dans "Nom d'utilisateur"
     var adminUnlocked by remember { mutableStateOf(false) }
     var customAdminServer by remember { mutableStateOf(initialServer) }
 
@@ -3823,13 +3910,105 @@ fun IptvSetupScreen(
     ) {
         item {
             Text(
-                text = "Espace Client & Paramètres",
+                text = "Espace Client & Activation",
                 color = Color.White,
                 fontSize = 20.sp,
                 fontWeight = FontWeight.Bold
             )
         }
 
+        // BLOC 1 : ACTIVATION À DISTANCE PAR ADRESSE MAC & CLÉ D'APPAREIL (ZÉRO SAISIE POUR LE CLIENT !)
+        item {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF151A24))
+                    .border(2.dp, Color(0xFF38BDF8), RoundedCornerShape(14.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "📲 Activation à distance (Sans rien taper)",
+                    color = Color(0xFF38BDF8),
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = 16.sp
+                )
+                Text(
+                    text = "Communiquez ces deux codes à votre installateur pour qu'il active votre abonnement à distance :",
+                    color = Color(0xFFCBD5E1),
+                    fontSize = 12.sp
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF0B0E14))
+                            .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
+                            .padding(12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("ADRESSE MAC", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(deviceIdentity.macAddress, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(Color(0xFF0B0E14))
+                            .border(1.dp, Color(0xFF334155), RoundedCornerShape(10.dp))
+                            .padding(12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("CLÉ D'APPAREIL (DEVICE KEY)", color = Color(0xFF94A3B8), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(deviceIdentity.deviceKey, color = Color(0xFFFACC15), fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                    }
+                }
+
+                activationStatusMsg?.let {
+                    Text(it, color = Color(0xFFFACC15), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+
+                TvActionButton(
+                    text = if (isVerifyingPanel) "Recherche de votre activation..." else "🔄 Activer mon abonnement à distance",
+                    icon = Icons.Default.Refresh,
+                    baseBgColor = Color(0xFF0284C7),
+                    baseContentColor = Color.White,
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = {
+                        if (isVerifyingPanel) return@TvActionButton
+                        isVerifyingPanel = true
+                        activationStatusMsg = "Vérification de votre appareil sur le serveur..."
+                        scope.launch {
+                            val remoteCfg = fetchRemoteDeviceActivation(deviceIdentity.macAddress, deviceIdentity.deviceKey)
+                            if (remoteCfg != null) {
+                                val resolvedUrl = if (remoteCfg.server.isNotBlank()) {
+                                    remoteCfg.server
+                                } else {
+                                    resolveAuthorizedServerForUser(remoteCfg.user, remoteCfg.pass, "")
+                                }
+                                isVerifyingPanel = false
+                                activationStatusMsg = "✅ Appareil activé avec succès !"
+                                onSave(resolvedUrl, remoteCfg.user, remoteCfg.pass)
+                            } else {
+                                isVerifyingPanel = false
+                                activationStatusMsg = "⏳ Aucun abonnement trouvé pour la clé ${deviceIdentity.deviceKey}. Transmettez votre MAC et votre Clé à votre installateur."
+                            }
+                        }
+                    }
+                )
+            }
+        }
+
+        // BLOC 2 : CONNEXION MANUELLE (Nom d'utilisateur & Mot de passe + Code secret 888899)
         item {
             Column(
                 modifier = Modifier
@@ -3840,8 +4019,7 @@ fun IptvSetupScreen(
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Text("Connexion à votre compte NeoTV", color = Color(0xFF38BDF8), fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                Text("Entrez simplement votre nom d'utilisateur et votre mot de passe :", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                Text("Connexion manuelle par identifiants", color = Color(0xFF8B5CF6), fontWeight = FontWeight.Bold, fontSize = 15.sp)
 
                 if (adminUnlocked) {
                     OutlinedTextField(
@@ -3914,6 +4092,7 @@ fun IptvSetupScreen(
             }
         }
 
+        // BLOC 3 : INFORMATIONS D'ABONNEMENT
         item {
             Column(
                 modifier = Modifier
@@ -3931,6 +4110,7 @@ fun IptvSetupScreen(
             }
         }
 
+        // BLOC 4 : CONTRÔLE PARENTAL
         item {
             Column(
                 modifier = Modifier
@@ -4032,7 +4212,7 @@ fun downloadUrlToFile(urlStr: String, destFile: File) {
         requestMethod = "GET"
         connectTimeout = 20000
         readTimeout = 45000
-        setRequestProperty("User-Agent", "NeoTV/8.2 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.3 (ExoPlayer)")
     }
     conn.inputStream.use { input ->
         destFile.outputStream().use { output ->
@@ -4486,7 +4666,7 @@ fun httpGet(urlStr: String): String {
         requestMethod = "GET"
         connectTimeout = 15000
         readTimeout = 35000
-        setRequestProperty("User-Agent", "NeoTV/8.2 (ExoPlayer)")
+        setRequestProperty("User-Agent", "NeoTV/8.3 (ExoPlayer)")
     }
     return conn.inputStream.bufferedReader().use { it.readText() }
 }
